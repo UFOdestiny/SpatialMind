@@ -1,8 +1,6 @@
 from models.heads.base import UncertaintyHeadBase
 from models.heads.uq_head import UQHead
 
-from models.unsup_heads import BASELINE_REGISTRY, UNSUPERVISED_HEAD_REGISTRY
-
 HEAD_REGISTRY = {
     "uq": UQHead,
 }

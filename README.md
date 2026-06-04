@@ -19,8 +19,7 @@ SpatialMind/
 ├── engine/
 ├── models/
 │   ├── features/
-│   ├── heads/
-│   └── unsup_heads/
+│   └── heads/
 ├── scripts/
 └── utils/
 ```

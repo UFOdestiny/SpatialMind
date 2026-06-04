@@ -54,7 +54,6 @@ from scripts.metrics import (
 from utils.common import collate_claim_cached_features
 from scripts.trainer import build_eval_training_arguments
 from models.heads import BASELINE_REGISTRY
-from models.unsup_heads import UNSUPERVISED_HEAD_ALIASES
 from utils.efficiency import (
     get_cpu_peak_memory_gb,
     get_gpu_peak_memory_gb,
