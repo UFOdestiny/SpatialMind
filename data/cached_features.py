@@ -1,23 +1,29 @@
 """
-cached_features.py - Chunk-based dataset for pre-extracted LLM features.
+cached_features.py - Chunk-based dataset over Phase-1 cached trace features.
 
-Phase 1 saves features in chunk files:
-    {cache_dir}/{split}/chunk_{i}.pt  — list of sample dicts
-    {cache_dir}/{split}/manifest.json — metadata (total_count, chunk_size, feature_dim, ...)
+Phase 1 writes, per split:
+    {cache_dir}/{split}/chunk_{i}.pt   — list of per-trace sample dicts
+    {cache_dir}/{split}/manifest.json  — {total_count, chunk_size, feature_dim,
+                                          chunk_sample_counts, total_pending, ...}
 
-Each sample dict contains:
-    features:           (seq_len, feature_dim) tensor
-    attention_mask:     (seq_len,) tensor
-    claims:             list of claim dicts (with aligned_token_ids / claim_type_id)
-    verified:           list of claim labels (0/1, optional -1 pending)
-    k_hop:              int
-    question:           str
-    generated_text:     str
-    dataset_name:       str
-    token_probs:        (gen_len, top_n) tensor (for unsupervised baselines)
-    log_likelihoods:    (gen_len,) tensor (for unsupervised baselines)
+Each cached sample dict (see the Phase-1 data contract) contains:
+    features        (L, D)      frozen per-token features
+    attention_mask  (L,)        1 for generated tokens
+    label           int         SAMPLE-LEVEL correctness (1 correct / 0 hallucination / -1 pending)
+    verified        list[int]   per-claim correctness (1 / 0 / -1 pending)
+    claims          list[dict]  {text, claim_type, claim_type_id, aligned_token_ids, ...}
+    k_hop           int
+    token_probs, log_likelihoods, question, generated_text, ...
+
+This dataset is TRACE-first: __getitem__ returns one trace with its ordered
+claims, per-claim labels, and the trace-level label, ready for the claim-level
+head + multi-task trace objective. Pending (-1) samples/claims are excluded from
+training and evaluation.
 """
 
+from __future__ import annotations
+
+import gc
 import json
 import logging
 from collections import OrderedDict
@@ -30,29 +36,21 @@ from torch.utils.data import Dataset, Sampler
 
 log = logging.getLogger(__name__)
 
-# Maximum number of chunks to keep in LRU cache.
-# Keep low (2) to avoid OOM on large datasets (chunks can be 20-40 GB each).
 MAX_CACHED_CHUNKS = 2
-# Number of parallel threads for preloading chunks
 PRELOAD_WORKERS = 2
+PENDING = -1
 
 
 class ChunkAwareSampler(Sampler[int]):
-    """Sampler that groups indices by chunk to maximize LRU cache hits.
+    """Group indices by chunk to maximize LRU cache hits; shuffle within/between chunks."""
 
-    Within each chunk, sample order is shuffled. Chunk order is also shuffled
-    per epoch. This reduces disk I/O from O(steps) random chunk loads to
-    O(num_chunks) sequential loads per epoch.
-    """
-
-    def __init__(self, dataset: "CachedFeatureDataset", seed: int = 42, drop_last: bool = False, batch_size: int = 1):
+    def __init__(self, dataset: "CachedFeatureDataset", seed: int = 42,
+                 drop_last: bool = False, batch_size: int = 1):
         self.seed = seed
         self.epoch = 0
         self.drop_last = drop_last
         self.batch_size = batch_size
         self._total = len(dataset)
-
-        # Group global indices by their chunk_idx
         self._chunk_groups: dict[int, list[int]] = {}
         for global_idx, (chunk_idx, _) in enumerate(dataset._index):
             self._chunk_groups.setdefault(chunk_idx, []).append(global_idx)
@@ -60,19 +58,15 @@ class ChunkAwareSampler(Sampler[int]):
     def __iter__(self) -> Iterator[int]:
         g = torch.Generator()
         g.manual_seed(self.seed + self.epoch)
-
         chunk_ids = list(self._chunk_groups.keys())
-        chunk_order = torch.randperm(len(chunk_ids), generator=g).tolist()
-
+        order = torch.randperm(len(chunk_ids), generator=g).tolist()
         indices: list[int] = []
-        for ci in chunk_order:
+        for ci in order:
             group = self._chunk_groups[chunk_ids[ci]]
             perm = torch.randperm(len(group), generator=g).tolist()
             indices.extend(group[p] for p in perm)
-
         if self.drop_last and len(indices) % self.batch_size != 0:
             indices = indices[: len(indices) - len(indices) % self.batch_size]
-
         return iter(indices)
 
     def __len__(self) -> int:
@@ -85,18 +79,7 @@ class ChunkAwareSampler(Sampler[int]):
 
 
 class CachedFeatureDataset(Dataset):
-    """Load pre-extracted features from chunk files on disk.
-
-    Supports efficient random access by mapping global indices to
-    (chunk_id, local_index) pairs via the manifest.
-    
-    Optimizations:
-    - Optional preload_all mode: loads all chunks into memory upfront (faster training)
-    - LRU cache eviction when not preloading (most recently used chunks kept)
-    - Parallel chunk loading with ThreadPoolExecutor
-    - Chunk data released immediately after indexing to reduce peak memory
-    - Configurable cache size via MAX_CACHED_CHUNKS
-    """
+    """Load Phase-1 cached traces with bounded-memory chunk access."""
 
     def __init__(
         self,
@@ -108,246 +91,162 @@ class CachedFeatureDataset(Dataset):
         preload_all: bool = False,
         max_cached_chunks: int = 0,
     ):
-        """
-        Args:
-            cache_dir: Root cache directory.
-            split: Data split name.
-            k_hop_values: Filter by difficulty. None = all.
-            max_samples: Limit samples. 0 = no limit.
-            skip_pending: Skip samples that still contain pending claim labels (-1).
-                Set to True for training, False for judge re-evaluation.
-            preload_all: If True, load all chunks into memory upfront.
-                Faster training at the cost of initial load time and memory.
-            max_cached_chunks: Override MAX_CACHED_CHUNKS. 0 = use default.
-                Set to a smaller value (e.g., 2) for large test sets to avoid OOM.
-        """
         self.split_dir = Path(cache_dir) / split
         manifest_path = self.split_dir / "manifest.json"
-
         if not manifest_path.exists():
             raise FileNotFoundError(
-                f"Manifest not found at {manifest_path}. "
-                "Run scripts/generate.py first to create cached features."
+                f"Manifest not found at {manifest_path}. Run scripts/generate.py first."
             )
-
         with open(manifest_path, "r") as f:
             self.manifest = json.load(f)
 
-        self.total_count = self.manifest["total_count"]
-        self.chunk_size = self.manifest["chunk_size"]
+        self.total_count = self.manifest.get("total_count", 0)
+        self.chunk_size = self.manifest.get("chunk_size", 0)
         self.feature_dim = self.manifest.get("feature_dim", 0)
         self._preload_all = preload_all
         self._max_cached_chunks = max_cached_chunks if max_cached_chunks > 0 else MAX_CACHED_CHUNKS
-
-        # Chunk file list
         self.chunk_files = sorted(self.split_dir.glob("chunk_*.pt"))
-        log.info(
-            "CachedFeatureDataset: split=%s, total=%d, chunks=%d, feature_dim=%d",
-            split, self.total_count, len(self.chunk_files), self.feature_dim,
-        )
+        self._chunk_cache: "OrderedDict[int, list]" = OrderedDict()
 
-        # LRU cache: OrderedDict maintains insertion order for LRU eviction
-        self._chunk_cache: OrderedDict[int, list] = OrderedDict()
-
-        # Build index with memory-efficient loading
         self._index = self._build_index(k_hop_values, max_samples, skip_pending)
-        
-        # Preload all chunks if requested (parallel loading)
-        if preload_all and len(self.chunk_files) > 0:
+        log.info(
+            "CachedFeatureDataset: split=%s, usable=%d/%d, chunks=%d, feature_dim=%d",
+            split, len(self._index), self.total_count, len(self.chunk_files), self.feature_dim,
+        )
+        if preload_all and self.chunk_files:
             self._preload_chunks()
 
-    def _build_index(
-        self,
-        k_hop_values: Optional[List[int]],
-        max_samples: int,
-        skip_pending: bool,
-    ) -> List[tuple]:
-        """Build sample index while minimizing peak memory usage.
-        
-        Optimization: When skip_pending=True and manifest shows total_pending=0,
-        and k_hop_values=None, we can build the index directly from manifest
-        without loading any chunk data.
-        """
-        index = []
-        skipped_pending = 0
-        
-        # Fast path: if no filtering needed, build index from manifest
+    # ------------------------------------------------------------------ #
+    def _build_index(self, k_hop_values, max_samples, skip_pending) -> List[tuple]:
+        index: List[tuple] = []
         total_pending = self.manifest.get("total_pending", 0)
-        total_claim_pending = self.manifest.get("total_claim_pending", 0)
-        can_skip_loading = (
-            (not skip_pending or (total_pending == 0 and total_claim_pending == 0))
-            and k_hop_values is None
-        )
-        
-        if can_skip_loading:
-            # Build index directly from manifest without loading chunks
-            chunk_counts = self.manifest.get("chunk_sample_counts", [])
-            for chunk_idx, count in enumerate(chunk_counts):
+        # Fast path: no filtering needed -> build straight from manifest counts.
+        if (not skip_pending or total_pending == 0) and not k_hop_values:
+            for chunk_idx, count in enumerate(self.manifest.get("chunk_sample_counts", [])):
                 for local_idx in range(count):
                     index.append((chunk_idx, local_idx))
                     if max_samples > 0 and len(index) >= max_samples:
-                        break
-                if max_samples > 0 and len(index) >= max_samples:
-                    break
-            log.info("  After filtering: %d samples (fast path, no chunk loading)", len(index))
+                        return index
             return index
 
-        # Slow path: need to load chunks to check pending/k_hop
-        import gc
+        # Slow path: inspect samples to skip pending / filter difficulty.
         for chunk_idx, chunk_path in enumerate(self.chunk_files):
-            chunk_data = torch.load(chunk_path, map_location="cpu", weights_only=False)
-            
-            for local_idx, sample in enumerate(chunk_data):
-                # Skip unjudged samples to prevent them entering training.
-                pending_claim = any(int(v) == -1 for v in sample.get("verified", []))
-                pending_sample = sample.get("label", -1) == -1
-                if skip_pending and (pending_claim or pending_sample):
-                    skipped_pending += 1
+            chunk = torch.load(chunk_path, map_location="cpu", weights_only=False)
+            for local_idx, sample in enumerate(chunk):
+                if skip_pending and int(sample.get("label", PENDING)) == PENDING:
                     continue
-                k_hop = sample.get("k_hop", 0)
-                if k_hop_values and k_hop not in k_hop_values:
+                if k_hop_values and sample.get("k_hop", 0) not in k_hop_values:
                     continue
                 index.append((chunk_idx, local_idx))
-                
-                # Early exit if max_samples reached
                 if max_samples > 0 and len(index) >= max_samples:
-                    break
-            
-            # Release chunk memory immediately after indexing
-            del chunk_data
-            gc.collect()  # Force garbage collection to reclaim memory
-            
-            if max_samples > 0 and len(index) >= max_samples:
-                break
-
-        log.info("  After filtering: %d samples (skipped %d pending)", len(index), skipped_pending)
+                    del chunk
+                    gc.collect()
+                    return index
+            del chunk
+            gc.collect()
         return index
 
-    def __len__(self):
-        return len(self._index)
-
     def _preload_chunks(self):
-        """Preload all chunks into memory using parallel threads."""
-        num_chunks = len(self.chunk_files)
-        log.info("Preloading %d chunks in parallel (workers=%d)...", num_chunks, PRELOAD_WORKERS)
-        
-        def load_one(chunk_idx: int) -> tuple:
-            path = self.chunk_files[chunk_idx]
-            data = torch.load(path, map_location="cpu", weights_only=False)
-            return chunk_idx, data
-        
-        with ThreadPoolExecutor(max_workers=PRELOAD_WORKERS) as executor:
-            results = list(executor.map(load_one, range(num_chunks)))
-        
-        # Store all loaded chunks
-        for chunk_idx, data in results:
-            self._chunk_cache[chunk_idx] = data
-        
-        log.info("Preloaded %d chunks into memory", len(self._chunk_cache))
+        def load_one(i):
+            return i, torch.load(self.chunk_files[i], map_location="cpu", weights_only=False)
+        with ThreadPoolExecutor(max_workers=PRELOAD_WORKERS) as ex:
+            for i, data in ex.map(load_one, range(len(self.chunk_files))):
+                self._chunk_cache[i] = data
 
     def _load_chunk(self, chunk_idx: int) -> list:
-        """Load chunk data with LRU caching."""
         if chunk_idx in self._chunk_cache:
-            # Move to end (most recently used) - skip if preloaded (all in cache)
             if not self._preload_all:
                 self._chunk_cache.move_to_end(chunk_idx)
             return self._chunk_cache[chunk_idx]
-
-        # Evict oldest chunks if cache is full (LRU eviction) - only when not preloaded
         if not self._preload_all:
             while len(self._chunk_cache) >= self._max_cached_chunks:
-                # popitem(last=False) removes the first (oldest) item
                 self._chunk_cache.popitem(last=False)
+        chunk = torch.load(self.chunk_files[chunk_idx], map_location="cpu", weights_only=False)
+        self._chunk_cache[chunk_idx] = chunk
+        return chunk
 
-        # Load and cache new chunk
-        path = self.chunk_files[chunk_idx]
-        chunk_data = torch.load(path, map_location="cpu", weights_only=False)
-        self._chunk_cache[chunk_idx] = chunk_data
-        return chunk_data
+    # ------------------------------------------------------------------ #
+    def __len__(self):
+        return len(self._index)
+
+    @staticmethod
+    def _usable_claims(sample: dict):
+        """Return (claims, claim_labels) filtered to claims with a 0/1 label.
+
+        Falls back to the sample-level label when per-claim `verified` is absent.
+        """
+        claims = sample.get("claims", []) or []
+        verified = sample.get("verified", []) or []
+        out_claims, out_labels = [], []
+        if verified:
+            for ci, claim in enumerate(claims):
+                if ci >= len(verified):
+                    break
+                v = int(verified[ci])
+                if v in (0, 1):
+                    out_claims.append(claim)
+                    out_labels.append(v)
+        if not out_claims:
+            # No usable per-claim labels: treat the whole trace as a single claim.
+            label = int(sample.get("label", 1))
+            label = label if label in (0, 1) else 1
+            out_claims = [{"claim_type_id": 2, "aligned_token_ids": []}]
+            out_labels = [label]
+        return out_claims, out_labels
 
     def __getitem__(self, idx):
         chunk_idx, local_idx = self._index[idx]
-        chunk_data = self._load_chunk(chunk_idx)
-        sample = chunk_data[local_idx]
-
-        claims = sample.get("claims", [])
-        verified = sample.get("verified", [])
-
-        verified = sample.get("verified", [])
-        sample_label = int(verified[-1]) if verified else int(sample.get("label", 1))
+        sample = self._load_chunk(chunk_idx)[local_idx]
+        claims, claim_labels = self._usable_claims(sample)
+        trace_label = int(sample.get("label", 1))
+        trace_label = trace_label if trace_label in (0, 1) else 1
         return {
-            "features": sample["features"],            # (seq_len, feature_dim)
-            "attention_mask": sample["attention_mask"],  # (seq_len,)
-            "labels": torch.tensor(sample_label, dtype=torch.long),
-            "k_hop": sample.get("k_hop", 0),
+            "features": sample["features"],
+            "attention_mask": sample["attention_mask"],
             "claims": claims,
-            "verified": verified,
+            "claim_labels": claim_labels,
+            "trace_label": trace_label,
+            "k_hop": int(sample.get("k_hop", 0)),
         }
 
     def load_raw(self, idx) -> dict:
-        """Load full raw sample dict (including token_probs, log_likelihoods)
-        for unsupervised baseline evaluation.
-
-        Handles both old field names (predicted_dir, ground_truth_dir) and
-        new field names (predicted_answer, ground_truth) transparently.
-        """
+        """Full raw sample dict (token_probs, log_likelihoods, text, ...) for baselines."""
         chunk_idx, local_idx = self._index[idx]
-        chunk_data = self._load_chunk(chunk_idx)
-        sample = chunk_data[local_idx]
-        # Backward compatibility: present both old and new field names
+        sample = self._load_chunk(chunk_idx)[local_idx]
         if "predicted_answer" not in sample and "predicted_dir" in sample:
             sample["predicted_answer"] = sample["predicted_dir"]
         if "ground_truth" not in sample and "ground_truth_dir" in sample:
             sample["ground_truth"] = sample["ground_truth_dir"]
         return sample
 
-    def get_claim_labels(self) -> list:
-        """Return flattened claim-level labels for logging/evaluation stats."""
-        labels = []
-        for chunk_idx, local_idx in self._index:
-            chunk_data = self._load_chunk(chunk_idx)
-            sample = chunk_data[local_idx]
-            verified = sample.get("verified")
-            if verified:
-                labels.extend([int(v) for v in verified if int(v) in (0, 1)])
-            else:
-                labels.append(int(sample.get("label", 1)))
-        return labels
-
-    def get_claim_label_stats(self) -> tuple:
-        """Return (total, n_correct, n_hallucinated) without polluting the LRU cache.
-
-        Loads one chunk at a time and releases it immediately, so peak memory
-        is bounded by a single chunk instead of MAX_CACHED_CHUNKS chunks.
-        Use this instead of ``get_claim_labels()`` when you only need counts.
-        """
-        import gc
-
-        # Group indices by chunk for sequential, single-pass loading
+    def trace_label_stats(self) -> tuple:
+        """(n_traces, n_correct, n_hallucinated) using top-level trace labels."""
+        n = len(self._index)
+        correct = 0
         chunk_to_locals: dict[int, list[int]] = {}
         for chunk_idx, local_idx in self._index:
             chunk_to_locals.setdefault(chunk_idx, []).append(local_idx)
-
-        total = 0
-        correct = 0
         for chunk_idx in sorted(chunk_to_locals):
-            # Bypass LRU cache — load directly and release after use
-            chunk_data = torch.load(
-                self.chunk_files[chunk_idx], map_location="cpu", weights_only=False
-            )
+            chunk = torch.load(self.chunk_files[chunk_idx], map_location="cpu", weights_only=False)
             for local_idx in chunk_to_locals[chunk_idx]:
-                sample = chunk_data[local_idx]
-                verified = sample.get("verified")
-                if verified:
-                    for v in verified:
-                        v_int = int(v)
-                        if v_int in (0, 1):
-                            total += 1
-                            correct += v_int
-                else:
-                    total += 1
-                    correct += int(sample.get("label", 1))
-            del chunk_data
+                lbl = int(chunk[local_idx].get("label", 1))
+                correct += 1 if lbl == 1 else 0
+            del chunk
             gc.collect()
+        return n, correct, n - correct
 
+    def claim_label_stats(self) -> tuple:
+        """(n_claims, n_correct, n_hallucinated) over usable per-claim labels."""
+        total = correct = 0
+        chunk_to_locals: dict[int, list[int]] = {}
+        for chunk_idx, local_idx in self._index:
+            chunk_to_locals.setdefault(chunk_idx, []).append(local_idx)
+        for chunk_idx in sorted(chunk_to_locals):
+            chunk = torch.load(self.chunk_files[chunk_idx], map_location="cpu", weights_only=False)
+            for local_idx in chunk_to_locals[chunk_idx]:
+                _, labels = self._usable_claims(chunk[local_idx])
+                total += len(labels)
+                correct += sum(labels)
+            del chunk
+            gc.collect()
         return total, correct, total - correct

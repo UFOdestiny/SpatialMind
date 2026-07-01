@@ -6,3 +6,8 @@ artifacts/
 .mypy_cache/
 .ruff_cache/
 .DS_Store
+
+.vscode
+.claude
+spatialmind
+latex

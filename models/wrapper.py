@@ -1,34 +1,68 @@
 """
-wrapper.py - Model wrappers for SpatialMind.
+wrapper.py - Multi-task training/inference wrapper over a claim-level UQ head.
 
-CachedFeatureModel: Phase 2 — trains head on pre-extracted features (no LLM).
+`ClaimUQModel` wraps any head implementing the HeadOutput contract and computes:
+  - claim loss  : BCE over per-claim logits vs per-claim labels (the localization
+                  signal; ablatable per claim type).
+  - trace loss  : BCE over the head's learned trace logit vs the trace label, when
+                  the head emits one (SpatialMind's multi-task objective). This
+                  directly optimizes the reported SAMPLE-LEVEL score.
+Total loss = claim_loss + trace_loss_weight * trace_loss.
+
+It also holds `build_feature_extractor` for the plug-and-play inference adapter.
 """
 
+from __future__ import annotations
+
 from dataclasses import dataclass
-from typing import Optional
+from typing import List, Optional
 
 import torch
 import torch.nn as nn
-from transformers.utils import ModelOutput
+import torch.nn.functional as F
 
-from models.features.hidden_states import HiddenStateExtractor
-from models.features.token_probs import TokenProbExtractor
 from models.features.attention import AttentionExtractor
 from models.features.combined import CombinedExtractor
+from models.features.hidden_states import HiddenStateExtractor
+from models.features.token_probs import TokenProbExtractor
+from models.heads.base import HeadOutput
+
 
 @dataclass
-class UQModelOutput(ModelOutput):
-    """HuggingFace Trainer-compatible output for UQ heads."""
-    loss: Optional[torch.Tensor] = None
-    logits: Optional[torch.Tensor] = None
+class UQOutput:
+    """Batch forward result."""
+    loss: Optional[torch.Tensor]
+    claim_logits: torch.Tensor          # (B, max_claims, C)
+    claim_mask: torch.Tensor            # (B, max_claims)
+    trace_logit: Optional[torch.Tensor]  # (B, C) or None
+    claim_loss: Optional[torch.Tensor] = None
+    trace_loss: Optional[torch.Tensor] = None
 
 
-class CachedFeatureModel(nn.Module):
-    """Phase 2 model: trains head on pre-extracted features (no LLM needed).
+def _binary_loss(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    loss_type: str = "bce",
+    pos_weight: float = 1.0,
+    focal_gamma: float = 2.0,
+    reduction: str = "mean",
+) -> torch.Tensor:
+    """Binary loss over 1-D logits/labels: bce | balanced_bce | focal."""
+    labels = labels.float()
+    if loss_type == "balanced_bce":
+        pw = torch.tensor([max(pos_weight, 1e-8)], device=logits.device, dtype=logits.dtype)
+        return F.binary_cross_entropy_with_logits(logits, labels, pos_weight=pw, reduction=reduction)
+    if loss_type == "focal":
+        bce = F.binary_cross_entropy_with_logits(logits, labels, reduction="none")
+        p = torch.sigmoid(logits)
+        pt = torch.where(labels > 0.5, p, 1.0 - p)
+        loss = ((1.0 - pt).pow(focal_gamma) * bce)
+        return loss.mean() if reduction == "mean" else loss.sum()
+    return F.binary_cross_entropy_with_logits(logits, labels, reduction=reduction)
 
-    Takes pre-extracted feature tensors directly, skipping the LLM forward pass.
-    Uses BCEWithLogitsLoss for binary classification (num_classes=1).
-    """
+
+class ClaimUQModel(nn.Module):
+    """Trains a claim-level head with an optional multi-task trace objective."""
 
     def __init__(
         self,
@@ -37,6 +71,7 @@ class CachedFeatureModel(nn.Module):
         loss_type: str = "bce",
         pos_weight: float = 1.0,
         focal_gamma: float = 2.0,
+        trace_loss_weight: float = 0.5,
     ):
         super().__init__()
         self.head = head
@@ -44,149 +79,74 @@ class CachedFeatureModel(nn.Module):
         self.loss_type = (loss_type or "bce").lower()
         self.pos_weight = float(pos_weight)
         self.focal_gamma = float(focal_gamma)
-
-    def _binary_loss(self, logits_1d: torch.Tensor, labels_1d: torch.Tensor) -> torch.Tensor:
-        labels_1d = labels_1d.float()
-        if self.loss_type == "balanced_bce":
-            pos_weight_t = torch.tensor(
-                [max(self.pos_weight, 1e-8)],
-                device=logits_1d.device,
-                dtype=logits_1d.dtype,
-            )
-            return nn.BCEWithLogitsLoss(pos_weight=pos_weight_t)(logits_1d, labels_1d)
-
-        if self.loss_type == "focal":
-            # Binary focal loss over logits.
-            bce = nn.functional.binary_cross_entropy_with_logits(
-                logits_1d,
-                labels_1d,
-                reduction="none",
-            )
-            probs = torch.sigmoid(logits_1d)
-            pt = torch.where(labels_1d > 0.5, probs, 1.0 - probs)
-            focal_weight = (1.0 - pt).pow(self.focal_gamma)
-            return (focal_weight * bce).mean()
-
-        return nn.BCEWithLogitsLoss()(logits_1d, labels_1d)
+        self.trace_loss_weight = float(trace_loss_weight)
 
     def forward(
         self,
-        features: torch.Tensor,
-        attention_mask: torch.Tensor,
-        labels: Optional[torch.Tensor] = None,
-        claim_masks=None,
-        claim_types=None,
-        claim_labels=None,
+        features: torch.Tensor,                 # (B, L, D)
+        attention_mask: torch.Tensor,           # (B, L)
+        claim_masks: Optional[List[torch.Tensor]] = None,
+        claim_types: Optional[List[torch.Tensor]] = None,
+        claim_labels: Optional[List[torch.Tensor]] = None,   # list of (C_i,)
+        trace_labels: Optional[torch.Tensor] = None,          # (B,)
         **kwargs,
-    ) -> UQModelOutput:
-        if claim_masks is not None and claim_labels is not None:
-            return self._forward_claim_level(features, attention_mask, claim_masks, claim_types, claim_labels)
+    ) -> UQOutput:
+        out: HeadOutput = self.head(features, attention_mask, claim_masks, claim_types)
 
-        logits = self.head(features, attention_mask)  # (batch, num_classes)
+        claim_loss = None
+        trace_loss = None
+        total = None
 
-        loss = None
-        if labels is not None:
-            if self.num_classes == 1:
-                loss = self._binary_loss(logits.squeeze(-1), labels.float())
-            else:
-                loss = nn.CrossEntropyLoss()(logits, labels.long())
-
-        return UQModelOutput(loss=loss, logits=logits)
-
-    def _forward_claim_level(
-        self,
-        features: torch.Tensor,
-        attention_mask: torch.Tensor,
-        claim_masks,
-        claim_types,
-        claim_labels,
-    ) -> UQModelOutput:
-        if claim_types is None:
-            claim_types = [
-                torch.full((m.shape[0],), 2, dtype=torch.long, device=features.device)
-                for m in claim_masks
-            ]
-        if getattr(self.head, "supports_claim_inputs", False):
-            if hasattr(self.head, "forward_claim"):
-                logits = self.head.forward_claim(
-                    features=features,
-                    attention_mask=attention_mask,
-                    claim_masks=claim_masks,
-                    claim_types=claim_types,
+        if claim_labels is not None:
+            # Gather valid (unpadded) per-claim logits and align with labels.
+            flat_logits = []
+            flat_labels = []
+            for i, labels_i in enumerate(claim_labels):
+                n = int(labels_i.shape[0])
+                if n == 0:
+                    continue
+                logits_i = out.claim_logits[i, :n]                 # (n, C)
+                flat_logits.append(logits_i.reshape(-1, self.num_classes))
+                flat_labels.append(labels_i.to(features.device).float())
+            if flat_logits:
+                logits_cat = torch.cat(flat_logits, dim=0).squeeze(-1)
+                labels_cat = torch.cat(flat_labels, dim=0)
+                claim_loss = _binary_loss(
+                    logits_cat, labels_cat, self.loss_type, self.pos_weight, self.focal_gamma
                 )
-            else:
-                logits = self.head(
-                    features=features,
-                    attention_mask=attention_mask,
-                    claim_masks=claim_masks,
-                    claim_types=claim_types,
-                )
-            
-            # Flatten labels
-            labels_flat = torch.cat([x.to(features.device).float() for x in claim_labels], dim=0)
-            
-            # Flatten logits: extract valid claims from padded (B, max_claims, C) tensor
-            # logits may be (B, max_claims, C) or (total_claims, C) depending on head impl
-            if logits.dim() == 3:
-                # (B, max_claims, num_classes) -> extract valid claims only
-                logits_list = []
-                for i in range(logits.shape[0]):
-                    num_claims = len(claim_labels[i])
-                    logits_list.append(logits[i, :num_claims, :])  # skip padding
-                logits_flat = torch.cat(logits_list, dim=0)  # (total_claims, num_classes)
-            elif logits.dim() == 2:
-                # Already flat: (total_claims, num_classes)
-                logits_flat = logits
-            else:
-                logits_flat = logits.view(-1, logits.shape[-1])
-            
-            if self.num_classes == 1:
-                loss = self._binary_loss(logits_flat.squeeze(-1), labels_flat)
-            else:
-                loss = nn.CrossEntropyLoss()(logits_flat, labels_flat.long())
-            return UQModelOutput(loss=loss, logits=logits_flat)
 
-        pooled_claim_features = []
-        flat_labels = []
+        if (
+            trace_labels is not None
+            and out.trace_logit is not None
+            and self.trace_loss_weight > 0
+        ):
+            trace_logit = out.trace_logit.reshape(-1, self.num_classes).squeeze(-1)
+            trace_loss = _binary_loss(
+                trace_logit, trace_labels.to(features.device).float(),
+                self.loss_type, self.pos_weight, self.focal_gamma,
+            )
 
-        batch_size = features.shape[0]
-        for i in range(batch_size):
-            token_features = features[i]  # (L, D)
-            token_mask = attention_mask[i].float()  # (L,)
-            sample_claim_masks = claim_masks[i].to(features.device).float()  # (C, L)
-            sample_claim_labels = claim_labels[i].to(features.device).float()  # (C,)
+        if claim_loss is not None:
+            total = claim_loss
+            if trace_loss is not None:
+                total = total + self.trace_loss_weight * trace_loss
+        elif trace_loss is not None:
+            total = self.trace_loss_weight * trace_loss
 
-            # Intersect claim mask with valid tokens only.
-            sample_claim_masks = sample_claim_masks * token_mask.unsqueeze(0)
-            denom = sample_claim_masks.sum(dim=1, keepdim=True).clamp(min=1.0)
-            claim_vecs = (sample_claim_masks @ token_features) / denom  # (C, D)
-
-            pooled_claim_features.append(claim_vecs)
-            flat_labels.append(sample_claim_labels)
-
-        claim_features = torch.cat(pooled_claim_features, dim=0).unsqueeze(1)  # (N_claim, 1, D)
-        claim_attn_mask = torch.ones(
-            claim_features.shape[0], 1, device=claim_features.device, dtype=attention_mask.dtype
+        return UQOutput(
+            loss=total,
+            claim_logits=out.claim_logits,
+            claim_mask=out.claim_mask,
+            trace_logit=out.trace_logit,
+            claim_loss=claim_loss,
+            trace_loss=trace_loss,
         )
-        logits = self.head(claim_features, claim_attn_mask)  # (N_claim, num_classes)
 
-        labels_flat = torch.cat(flat_labels, dim=0)
-        if self.num_classes == 1:
-            loss = self._binary_loss(logits.squeeze(-1), labels_flat)
-        else:
-            loss = nn.CrossEntropyLoss()(logits, labels_flat.long())
-
-        return UQModelOutput(loss=loss, logits=logits)
-
-    def get_trainable_params(self):
+    def trainable_params(self):
         return [p for p in self.head.parameters() if p.requires_grad]
 
     def count_trainable_params(self) -> int:
-        return sum(p.numel() for p in self.get_trainable_params())
-
-    def num_parameters(self, exclude_embeddings: bool = False) -> int:
-        _ = exclude_embeddings
-        return sum(p.numel() for p in self.head.parameters() if p.requires_grad)
+        return sum(p.numel() for p in self.trainable_params())
 
 
 def build_feature_extractor(
@@ -196,36 +156,27 @@ def build_feature_extractor(
     temperature: float = 1.0,
     attention_layers: str = "",
     attention_heads: str = "all",
-    attn_history_sz: int = 10,
-    pool_attention: bool = True,
+    attn_history_sz: int = 3,
+    pool_attention: bool = False,
     num_layers: int = 32,
     num_heads: int = 32,
 ) -> CombinedExtractor:
-    """Build the combined feature extractor."""
-    if hidden_state_layers == "all":
-        layer_nums = None
-    else:
-        layer_nums = [int(x.strip()) for x in hidden_state_layers.split(",")]
-
+    """Build the frozen feature extractor used at inference (Phase 1 caches offline)."""
+    layer_nums = None if hidden_state_layers == "all" else [int(x) for x in hidden_state_layers.split(",")]
     extractors = [
         HiddenStateExtractor(layer_nums=layer_nums, hidden_size=hidden_size),
         TokenProbExtractor(top_n=top_n_probs, temperature=temperature),
     ]
-
     if attention_layers:
         if str(attention_layers).strip().lower() == "all":
-            attn_layer_nums = list(range(num_layers))
+            attn_layers = list(range(num_layers))
         else:
-            attn_layer_nums = [int(x.strip()) for x in attention_layers.split(",")]
+            attn_layers = [int(x) for x in attention_layers.split(",")]
         extractors.append(
             AttentionExtractor(
-                layer_nums=attn_layer_nums,
-                head_nums=attention_heads,
-                attn_history_sz=attn_history_sz,
-                pool=pool_attention,
-                num_layers=num_layers,
-                num_heads=num_heads,
+                layer_nums=attn_layers, head_nums=attention_heads,
+                attn_history_sz=attn_history_sz, pool=pool_attention,
+                num_layers=num_layers, num_heads=num_heads,
             )
         )
-
     return CombinedExtractor(extractors)

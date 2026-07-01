@@ -1,7 +1,6 @@
 """Library utilities for SpatialMind."""
 from utils.common import (
-    collate_cached_features,
-    make_binary_compute_metrics,
+    collate_claim_traces,
     load_llm_from_path,
     load_tokenizer_from_path,
     resolve_torch_dtype,

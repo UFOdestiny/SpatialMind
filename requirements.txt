@@ -20,5 +20,4 @@ pyyaml>=6.0.1
 matplotlib>=3.8.4
 
 # Optional packages
-# vllm>=0.4.0
-# wandb>=0.16.0
+# vllm>=0.4.0  # only needed for Phase-1 generation

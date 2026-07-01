@@ -112,10 +112,17 @@ class CausalLMWithUncertainty(nn.Module):
             gen_output, input_ids, attention_mask, output_attentions,
         )
 
-        # Run UQ head
-        logits = self.ue_head(features, feat_mask)  # (1, 1)
-        logit_val = logits.squeeze().cpu().item()
-        uncertainty = float(expit(logit_val))
+        # Run UQ head. The head returns a HeadOutput; with no claim masks it
+        # treats the whole valid trace as a single claim, so claim_logits is
+        # (1, 1, 1). If the head emits a learned trace logit, prefer it.
+        head_out = self.ue_head(features, feat_mask)
+        if getattr(head_out, "trace_logit", None) is not None:
+            logit_val = head_out.trace_logit.reshape(-1)[0].cpu().item()
+        else:
+            logit_val = head_out.claim_logits.reshape(-1)[0].cpu().item()
+        confidence = float(expit(logit_val))
+        # Uncertainty (higher => more likely hallucination) is 1 - confidence.
+        uncertainty = 1.0 - confidence
 
         return generated_text, uncertainty
 
@@ -232,6 +239,7 @@ class CausalLMWithUncertainty(nn.Module):
             n_layers=head_cfg.get("n_layers", 2),
             n_heads=head_cfg.get("n_heads", 8),
             dropout=head_cfg.get("dropout", 0.1),
+            max_seq_len=head_cfg.get("max_seq_len", 512),
         )
         head.load_state_dict(
             torch.load(f"{head_path}/head_weights.pth", map_location="cpu")
