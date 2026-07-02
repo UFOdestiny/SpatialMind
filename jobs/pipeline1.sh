@@ -6,7 +6,7 @@
 #   RESUME_JOB_ID=<id> sbatch jobs/pipeline1.sh   # resume a prior run
 ###############################################################################
 
-#SBATCH --job-name=sm-llama
+#SBATCH --job-name=llama
 #SBATCH --account=fsu-compsci-dept
 #SBATCH --qos=fsu-compsci-dept
 #SBATCH --nodes=1

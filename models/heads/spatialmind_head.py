@@ -202,122 +202,174 @@ class SpatialMindHead(UncertaintyHeadBase):
         claim_masks: List[torch.Tensor],
         claim_types: Optional[List[torch.Tensor]] = None,
     ) -> List[torch.Tensor]:
+        """Fully-batched claim scoring.
+
+        All claims across the batch are flattened into a single Transformer pass
+        (instead of one pass per trace), and the cross-claim BiLSTM is run with
+        pack_padded_sequence over the per-trace claim sequences. This is
+        numerically equivalent to the per-trace loop (self-attention and LSTM are
+        independent across rows/sequences) but launches O(1) big kernels instead
+        of O(batch) small ones. See `_forward_claims_loop` for the reference.
+        """
         bsz, seq_len, _ = features.shape
         seq_len = min(seq_len, self.max_seq_len)
         features = features[:, :seq_len, :]
         attention_mask = attention_mask[:, :seq_len]
         device = features.device
 
-        x_norm = self.input_norm(features)
-        u = self.proj(x_norm)                          # (B, L, d_h) projected tokens
-        raw = self.raw_proj(features)                  # (B, L, d_h) prototype space
-        global_anchor = self.masked_mean(raw, attention_mask)  # (B, d_h)
-        src_pad = attention_mask == 0
+        u = self.proj(self.input_norm(features))                 # (B, L, d_h)
+        raw = self.raw_proj(features)                            # (B, L, d_h)
+        global_anchor = self.masked_mean(raw, attention_mask)     # (B, d_h)
+        src_pad = attention_mask == 0                            # (B, L)
 
-        self._cached_states = []
-        per_trace_logits: List[torch.Tensor] = []
-
+        # ---- Flatten claims across the batch, preserving per-trace order. ----
+        counts: List[int] = []
+        cm_list: List[torch.Tensor] = []
+        type_list: List[torch.Tensor] = []
+        pos_list: List[torch.Tensor] = []
+        trace_ids: List[int] = []
         for i in range(bsz):
             cm = claim_masks[i].to(device).float()
-            if cm.numel() == 0 or cm.shape[0] == 0:
+            n = 0 if (cm.numel() == 0) else cm.shape[0]
+            if n > 0:
+                if cm.shape[1] > seq_len:
+                    cm = cm[:, :seq_len]
+                elif cm.shape[1] < seq_len:
+                    cm = F.pad(cm, (0, seq_len - cm.shape[1]), value=0.0)
+                cm_list.append(cm)
+                if self.use_type and claim_types is not None:
+                    t = claim_types[i].to(device).long()
+                    t = t[:n] if t.shape[0] > n else F.pad(t, (0, n - t.shape[0]), value=CONCLUSION_TYPE_ID)
+                else:
+                    t = torch.full((n,), CONCLUSION_TYPE_ID, dtype=torch.long, device=device)
+                type_list.append(t)
+                cp = torch.arange(n, device=device).clamp(max=_MAX_CLAIM_POS - 1)
+                pos_list.append(cp)
+                trace_ids.extend([i] * n)
+            counts.append(n)
+
+        total = sum(counts)
+        if total == 0:
+            self._cached_states = [{} for _ in range(bsz)]
+            return [torch.zeros(0, self.num_classes, device=device) for _ in range(bsz)]
+
+        cm_all = torch.cat(cm_list, dim=0)                        # (T, L)
+        t_all = torch.cat(type_list, dim=0)                       # (T,)
+        pos_all = torch.cat(pos_list, dim=0)                      # (T,)
+        trace_idx = torch.tensor(trace_ids, device=device, dtype=torch.long)  # (T,)
+        type_vec = self.type_embedding(t_all)                     # (T, d_h)
+
+        # ---- 2. Claim marking + local encoding (ONE Transformer pass) ----
+        base = u[trace_idx]                                       # (T, L, d_h)
+        marked = base + self.span_embedding(cm_all.long())
+        if self.use_type:
+            marked = marked + type_vec.unsqueeze(1)
+        cls = self.cls_token.expand(total, -1, -1)                # (T, 1, d_h)
+        seq_in = torch.cat([cls, marked], dim=1)                  # (T, 1+L, d_h)
+        in_len = min(seq_in.shape[1], self.max_seq_len)
+        seq_in = seq_in[:, :in_len, :]
+        pos_ids = torch.arange(in_len, device=device).unsqueeze(0).expand(total, -1)
+        seq_in = seq_in + self.token_pos_embedding(pos_ids)
+        cls_pad = torch.zeros(total, 1, dtype=torch.bool, device=device)
+        pad_mask = torch.cat([cls_pad, src_pad[trace_idx]], dim=1)[:, :in_len]
+        enc = self.encoder(seq_in, src_key_padding_mask=pad_mask)
+        z = enc[:, 0, :]                                          # (T, d_h)
+
+        # ---- 3. Sequential integration (cross-claim BiLSTM via packing) ----
+        z_pos = z + self.claim_pos_embedding(pos_all)
+        if self.use_cross_claim:
+            nz = [c for c in counts if c > 0]
+            seqs = torch.split(z_pos, nz, dim=0)                  # tuple of (C_i, d_h)
+            padded = nn.utils.rnn.pad_sequence(seqs, batch_first=True)  # (n_seq, maxC, d_h)
+            lengths = torch.tensor(nz, dtype=torch.long)
+            packed = nn.utils.rnn.pack_padded_sequence(
+                padded, lengths, batch_first=True, enforce_sorted=False)
+            lstm_out, _ = self.claim_lstm(packed)
+            unpacked, _ = nn.utils.rnn.pad_packed_sequence(lstm_out, batch_first=True)
+            z_seq_flat = torch.cat([unpacked[j, :nz[j]] for j in range(len(nz))], dim=0)  # (T, 2*hidden)
+            z_seq = self.claim_lstm_proj(self.claim_lstm_norm(z_seq_flat))
+            gate = torch.sigmoid(self.seq_gate(torch.cat([z, z_seq], dim=-1)))
+            fused = gate * z + (1.0 - gate) * z_seq
+        else:
+            fused = z_pos
+
+        # ---- 4. Prototype + global anchor/gap (batched) ----
+        anchor = global_anchor[trace_idx]                         # (T, d_h)
+        prototype = self._claim_prototype_batched(raw, attention_mask, cm_all, trace_idx)
+        global_gap = torch.abs(fused - anchor)
+
+        # ---- 5. Span statistics (batched) ----
+        if self.use_scope:
+            valid_len_all = attention_mask.float().sum(dim=1)[trace_idx]   # (T,)
+            scope = self.scope_mlp(self._scope_descriptor_batched(cm_all, valid_len_all))
+        else:
+            scope = torch.zeros(total, self.head_dim, device=device)
+
+        extras = scope + (type_vec if self.use_type else 0.0) + global_gap
+        seed = self.seed_proj(torch.cat([prototype, fused, anchor, extras], dim=-1))
+
+        # ---- 6. Reliability bank ----
+        if self.use_reliability_bank:
+            pi = F.softmax(self.bank_selector(
+                torch.cat([seed, anchor, torch.abs(seed - anchor)], dim=-1)), dim=-1)
+            bank_proto = pi @ self.reliability_bank
+            temp = self.reliability_temp.clamp(min=1e-2)
+            r_gate = torch.sigmoid(self.reliability_gate(
+                torch.cat([seed, bank_proto, anchor, torch.abs(bank_proto - seed)], dim=-1)) / temp)
+            reliab = self.reliability_residual(r_gate * seed + (1.0 - r_gate) * bank_proto) + seed
+        else:
+            reliab = seed
+
+        # ---- 7. Per-claim logit ----
+        reliab_gap = torch.abs(reliab - anchor)
+        logits_all = self.claim_scorer(
+            torch.cat([prototype, reliab, reliab_gap, type_vec], dim=-1))  # (T, C)
+
+        # ---- Split back to per-trace, cache states for the trace read-out. ----
+        per_trace_logits: List[torch.Tensor] = []
+        self._cached_states = []
+        offset = 0
+        for i in range(bsz):
+            c = counts[i]
+            if c == 0:
                 per_trace_logits.append(torch.zeros(0, self.num_classes, device=device))
                 self._cached_states.append({})
                 continue
-            # Align claim mask width to seq_len.
-            if cm.shape[1] > seq_len:
-                cm = cm[:, :seq_len]
-            elif cm.shape[1] < seq_len:
-                cm = F.pad(cm, (0, seq_len - cm.shape[1]), value=0.0)
-            n_claims = cm.shape[0]
-
-            valid = attention_mask[i].float()
-            valid_len = float(valid.sum().item())
-
-            # Claim types (default to conclusion=2 when absent).
-            if self.use_type and claim_types is not None:
-                t = claim_types[i].to(device).long()
-                if t.shape[0] > n_claims:
-                    t = t[:n_claims]
-                elif t.shape[0] < n_claims:
-                    t = F.pad(t, (0, n_claims - t.shape[0]), value=CONCLUSION_TYPE_ID)
-            else:
-                t = torch.full((n_claims,), CONCLUSION_TYPE_ID, dtype=torch.long, device=device)
-            type_vec = self.type_embedding(t)          # (C, d_h)
-
-            # --- 2. Claim marking + local encoding (one Transformer pass per claim) ---
-            base = u[i].unsqueeze(0).expand(n_claims, -1, -1)          # (C, L, d_h)
-            span_emb = self.span_embedding(cm.long())                  # (C, L, d_h)
-            marked = base + span_emb
-            if self.use_type:
-                marked = marked + type_vec.unsqueeze(1)
-            cls = self.cls_token.expand(n_claims, -1, -1)              # (C, 1, d_h)
-            seq_in = torch.cat([cls, marked], dim=1)                   # (C, 1+L, d_h)
-            in_len = min(seq_in.shape[1], self.max_seq_len)
-            seq_in = seq_in[:, :in_len, :]
-            pos_ids = torch.arange(in_len, device=device).unsqueeze(0).expand(n_claims, -1)
-            seq_in = seq_in + self.token_pos_embedding(pos_ids)
-            cls_pad = torch.zeros(n_claims, 1, dtype=torch.bool, device=device)
-            pad_mask = torch.cat([cls_pad, src_pad[i].unsqueeze(0).expand(n_claims, -1)], dim=1)[:, :in_len]
-            enc = self.encoder(seq_in, src_key_padding_mask=pad_mask)
-            z = enc[:, 0, :]                                           # (C, d_h) local claim states
-
-            # --- 3. Sequential integration ---
-            claim_pos = torch.arange(min(n_claims, _MAX_CLAIM_POS), device=device)
-            if n_claims > _MAX_CLAIM_POS:
-                claim_pos = F.pad(claim_pos, (0, n_claims - _MAX_CLAIM_POS), value=_MAX_CLAIM_POS - 1)
-            z_pos = z + self.claim_pos_embedding(claim_pos)
-            if self.use_cross_claim:
-                lstm_out, _ = self.claim_lstm(z_pos.unsqueeze(0))
-                z_seq = self.claim_lstm_norm(lstm_out.squeeze(0))     # (C, 2*hidden)
-                z_seq = self.claim_lstm_proj(z_seq)                   # (C, d_h)
-                gate = torch.sigmoid(self.seq_gate(torch.cat([z, z_seq], dim=-1)))
-                fused = gate * z + (1.0 - gate) * z_seq
-            else:
-                fused = z_pos
-
-            # --- 4. Prototype + global gap ---
-            prototype = self.claim_prototype(raw[i], cm, valid)       # (C, d_h)
-            anchor = global_anchor[i].unsqueeze(0).expand(n_claims, -1)
-            global_gap = torch.abs(fused - anchor)
-
-            # --- 5. Span statistics ---
-            if self.use_scope:
-                scope = self.scope_mlp(self._scope_descriptor(cm, valid_len))
-            else:
-                scope = torch.zeros(n_claims, self.head_dim, device=device)
-
-            extras = scope + (type_vec if self.use_type else 0.0) + global_gap
-            seed = self.seed_proj(torch.cat([prototype, fused, anchor, extras], dim=-1))
-
-            # --- 6. Reliability bank ---
-            if self.use_reliability_bank:
-                sel_logits = self.bank_selector(
-                    torch.cat([seed, anchor, torch.abs(seed - anchor)], dim=-1)
-                )
-                pi = F.softmax(sel_logits, dim=-1)                    # (C, K)
-                bank_proto = pi @ self.reliability_bank               # (C, d_h)
-                temp = self.reliability_temp.clamp(min=1e-2)
-                r_gate = torch.sigmoid(
-                    self.reliability_gate(
-                        torch.cat([seed, bank_proto, anchor, torch.abs(bank_proto - seed)], dim=-1)
-                    ) / temp
-                )
-                reliab = self.reliability_residual(r_gate * seed + (1.0 - r_gate) * bank_proto)
-                reliab = reliab + seed  # residual
-            else:
-                reliab = seed
-
-            # --- 7. Per-claim logit ---
-            reliab_gap = torch.abs(reliab - anchor)
-            claim_logit = self.claim_scorer(
-                torch.cat([prototype, reliab, reliab_gap, type_vec], dim=-1)
-            )
-            per_trace_logits.append(claim_logit)
-
-            # Cache states for the trace read-out.
-            self._cached_states.append({"reliab": reliab, "type": t, "anchor": global_anchor[i]})
-
+            sl = slice(offset, offset + c)
+            per_trace_logits.append(logits_all[sl])
+            self._cached_states.append(
+                {"reliab": reliab[sl], "type": t_all[sl], "anchor": global_anchor[i]})
+            offset += c
         return per_trace_logits
+
+    @staticmethod
+    def _claim_prototype_batched(raw, attention_mask, cm_all, trace_idx):
+        """Masked mean-pool raw token features within each claim span (batched)."""
+        valid = attention_mask.float()[trace_idx]                 # (T, L)
+        cm = cm_all * valid
+        denom = cm.sum(dim=1, keepdim=True).clamp(min=1.0)
+        raw_rows = raw[trace_idx]                                  # (T, L, d_h)
+        return torch.einsum("tl,tld->td", cm, raw_rows) / denom
+
+    def _scope_descriptor_batched(self, claim_mask: torch.Tensor, valid_len: torch.Tensor) -> torch.Tensor:
+        """Batched version of `_scope_descriptor` over (T, L) masks with per-row valid_len."""
+        T, L = claim_mask.shape
+        device = claim_mask.device
+        positions = torch.arange(L, device=device, dtype=torch.float32).unsqueeze(0)
+        size = claim_mask.sum(dim=1).clamp(min=1.0)               # (T,)
+        v = valid_len.clamp(min=1.0)                              # (T,)
+        frac = (size / v).clamp(0.0, 1.0)
+        log_ratio = torch.log1p(size) / torch.log1p(v)
+        centroid = (claim_mask * positions).sum(dim=1) / (size * v)
+        has_tok = claim_mask > 0
+        any_tok = has_tok.any(dim=1)
+        first = torch.where(any_tok, torch.argmax(has_tok.float(), dim=1).float(),
+                            torch.zeros(T, device=device))
+        rev = torch.flip(has_tok.float(), dims=[1])
+        last = torch.where(any_tok, (L - 1 - torch.argmax(rev, dim=1)).float(),
+                           torch.zeros(T, device=device))
+        width = ((last - first + 1.0) / v).clamp(0.0, 1.0)
+        return torch.stack([frac, log_ratio, centroid.clamp(0.0, 1.0), width], dim=-1)
 
     def forward_trace(
         self,

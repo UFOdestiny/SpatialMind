@@ -72,14 +72,21 @@ class ClaimUQModel(nn.Module):
         pos_weight: float = 1.0,
         focal_gamma: float = 2.0,
         trace_loss_weight: float = 0.5,
+        claim_pos_weight: Optional[float] = None,
+        trace_pos_weight: Optional[float] = None,
     ):
         super().__init__()
         self.head = head
         self.num_classes = num_classes
         self.loss_type = (loss_type or "bce").lower()
-        self.pos_weight = float(pos_weight)
         self.focal_gamma = float(focal_gamma)
         self.trace_loss_weight = float(trace_loss_weight)
+        # The claim-level and trace-level tasks have OPPOSITE class balance
+        # (e.g. ~85% of claims are "correct" but only ~27% of traces are), so
+        # balanced_bce must weight them separately. Fall back to a shared
+        # pos_weight when per-level values are not supplied.
+        self.claim_pos_weight = float(claim_pos_weight if claim_pos_weight is not None else pos_weight)
+        self.trace_pos_weight = float(trace_pos_weight if trace_pos_weight is not None else pos_weight)
 
     def forward(
         self,
@@ -112,7 +119,7 @@ class ClaimUQModel(nn.Module):
                 logits_cat = torch.cat(flat_logits, dim=0).squeeze(-1)
                 labels_cat = torch.cat(flat_labels, dim=0)
                 claim_loss = _binary_loss(
-                    logits_cat, labels_cat, self.loss_type, self.pos_weight, self.focal_gamma
+                    logits_cat, labels_cat, self.loss_type, self.claim_pos_weight, self.focal_gamma
                 )
 
         if (
@@ -123,7 +130,7 @@ class ClaimUQModel(nn.Module):
             trace_logit = out.trace_logit.reshape(-1, self.num_classes).squeeze(-1)
             trace_loss = _binary_loss(
                 trace_logit, trace_labels.to(features.device).float(),
-                self.loss_type, self.pos_weight, self.focal_gamma,
+                self.loss_type, self.trace_pos_weight, self.focal_gamma,
             )
 
         if claim_loss is not None:

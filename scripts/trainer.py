@@ -138,12 +138,17 @@ def _build_loader(ds: CachedFeatureDataset, batch_size: int, shuffle: bool,
     if shuffle and not ds._preload_all:
         sampler = ChunkAwareSampler(ds, seed=seed, drop_last=False, batch_size=batch_size)
         shuffle = False
-    return DataLoader(
-        ds, batch_size=batch_size, shuffle=shuffle, sampler=sampler,
+    kwargs = dict(
+        batch_size=batch_size, shuffle=shuffle, sampler=sampler,
         num_workers=num_workers, collate_fn=collate_claim_traces,
         pin_memory=torch.cuda.is_available(), drop_last=False,
-        persistent_workers=num_workers > 0,
     )
+    if num_workers > 0:
+        # Overlap chunk I/O + collate with GPU compute. Safe now that chunks are
+        # small (~6-10 GB); each worker holds only MAX_CACHED_CHUNKS of them.
+        kwargs["persistent_workers"] = True
+        kwargs["prefetch_factor"] = 4
+    return DataLoader(ds, **kwargs)
 
 
 def train_loop(

@@ -108,6 +108,22 @@ def _make_loader(ds, batch_size):
                       pin_memory=torch.cuda.is_available(), num_workers=2)
 
 
+def _skipped_report(method_type, head_type, base_model, split, difficulty_field):
+    """Report for a split with no usable (labeled) samples: recorded, not crashed."""
+    return {
+        "method_type": method_type,
+        "head_type": head_type,
+        "base_model_name": base_model,
+        "split": split,
+        "difficulty_field": difficulty_field,
+        "total_samples": 0,
+        "status": "skipped_no_usable_samples",
+        "overall_metrics": {},
+        "per_difficulty_metrics": {},
+        "efficiency": {},
+    }
+
+
 def _per_difficulty(k_hops, labels, scores, field, threshold=0.5):
     out = {}
     for d in sorted(set(k_hops.tolist())):
@@ -136,6 +152,14 @@ def evaluate_head(args, cfg, cache_dir, output_dir, difficulty_field):
     amp_dtype = _amp_dtype(cfg.training.amp_dtype)
 
     test_ds = CachedFeatureDataset(cache_dir, args.split, max_samples=args.max_samples, max_cached_chunks=2)
+    if len(test_ds) == 0:
+        log.warning(
+            "Eval split '%s' has 0 usable samples (all pending/unjudged?) — skipping %s. "
+            "Run scripts/judge.py on this cache to assign labels.",
+            args.split, head_cfg["head_type"],
+        )
+        return _skipped_report("supervised", head_cfg["head_type"],
+                               _base_model_name(cache_dir, args.split, cfg), args.split, difficulty_field)
 
     # Re-select aggregation on the eval cache's own validation split (fair OOD calibration).
     aggregation = head_cfg.get("aggregation", {"method": "conc", "mix_weights": None})
@@ -274,7 +298,8 @@ def _baseline_trace_scores(estimator, ds, aggregation, norm_stats):
         claim_conf, claim_types,
         method=aggregation["method"], mix_weights=aggregation.get("mix_weights"),
     )
-    return scores, labels, k_hops
+    n_claims = np.array([len(c) for c in claim_conf], dtype=int)
+    return scores, labels, k_hops, n_claims
 
 
 def evaluate_baselines(args, cfg, cache_dir, output_dir, difficulty_field, names=None):
@@ -283,6 +308,13 @@ def evaluate_baselines(args, cfg, cache_dir, output_dir, difficulty_field, names
     reports = {}
     base_model = _base_model_name(cache_dir, args.split, cfg)
     test_ds = CachedFeatureDataset(cache_dir, args.split, max_samples=args.max_samples, max_cached_chunks=2)
+    if len(test_ds) == 0:
+        log.warning(
+            "Eval split '%s' has 0 usable samples (all pending/unjudged?) — skipping baselines. "
+            "Run scripts/judge.py on this cache to assign labels.", args.split,
+        )
+        return {name: _skipped_report("unsupervised", name, base_model, args.split, difficulty_field)
+                for name in names}
     try:
         val_ds = CachedFeatureDataset(cache_dir, args.val_split, max_cached_chunks=2)
     except FileNotFoundError:
@@ -310,7 +342,7 @@ def evaluate_baselines(args, cfg, cache_dir, output_dir, difficulty_field, names
             aggregation = select_aggregation(ref_conf, ref_labels, ref_types, objective="auroc")
 
         t0 = time.time()
-        scores, labels, k_hops = _baseline_trace_scores(estimator, test_ds, aggregation, norm_stats)
+        scores, labels, k_hops, n_claims = _baseline_trace_scores(estimator, test_ds, aggregation, norm_stats)
         infer_s = time.time() - t0
         metrics = compute_all_metrics(labels, scores)
         reports[name] = {
@@ -327,6 +359,13 @@ def evaluate_baselines(args, cfg, cache_dir, output_dir, difficulty_field, names
             "efficiency": {"params_m": 0.0, "inference_s": infer_s,
                            "samples_per_second": len(labels) / infer_s if infer_s > 0 else 0.0},
         }
+        if args.save_predictions:
+            # Store enough for the length-confound diagnostic (n_claims via claim_probs len).
+            reports[name]["predictions"] = [
+                {"sample_id": i, "trace_label": int(labels[i]), "trace_score": float(scores[i]),
+                 "k_hop": int(k_hops[i]), "claim_probs": [0.0] * int(n_claims[i])}
+                for i in range(len(labels))
+            ]
         m = metrics
         log.info("baseline %-14s AUROC=%.4f PR-AUC=%.4f Acc=%.4f ECE=%.4f",
                  name, m["roc_auc"], m["pr_auc"], m["accuracy"], m["ece"])
@@ -354,10 +393,11 @@ def main():
         all_reports[report["head_type"]] = report
         with open(os.path.join(output_dir, "evaluation_report.json"), "w") as f:
             json.dump(report, f, indent=2, default=str)
-        m = report["overall_metrics"]
-        log.info("HEAD %-14s AUROC=%.4f PR-AUC=%.4f Acc=%.4f ECE=%.4f (agg=%s)",
-                 report["head_type"], m["roc_auc"], m["pr_auc"], m["accuracy"], m["ece"],
-                 report["aggregation"]["method"])
+        m = report.get("overall_metrics", {})
+        if m:
+            log.info("HEAD %-14s AUROC=%.4f PR-AUC=%.4f Acc=%.4f ECE=%.4f (agg=%s)",
+                     report["head_type"], m["roc_auc"], m["pr_auc"], m["accuracy"], m["ece"],
+                     report.get("aggregation", {}).get("method", "-"))
 
     if args.eval_baselines:
         names = [b.strip() for b in args.baselines.split(",")] if args.baselines else None
@@ -375,7 +415,11 @@ def main():
     log.info("=" * 70)
     log.info("SUMMARY (sample-level)")
     for name, report in all_reports.items():
-        m = report["overall_metrics"]
+        m = report.get("overall_metrics", {})
+        if not m or report.get("status") == "skipped_no_usable_samples":
+            log.info("  %-16s [%-12s] SKIPPED (no usable samples)",
+                     name, report.get("method_type", "?"))
+            continue
         log.info("  %-16s [%-12s] AUROC=%.4f PR-AUC=%.4f Acc=%.4f ECE=%.4f",
                  name, report.get("method_type", "?"), m.get("roc_auc", 0), m.get("pr_auc", 0),
                  m.get("accuracy", 0), m.get("ece", 0))

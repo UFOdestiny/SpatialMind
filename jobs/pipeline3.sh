@@ -6,7 +6,7 @@
 #   RESUME_JOB_ID=<id> sbatch jobs/pipeline3.sh
 ###############################################################################
 
-#SBATCH --job-name=sm-gemma
+#SBATCH --job-name=gemma
 #SBATCH --account=fsu-compsci-dept
 #SBATCH --qos=fsu-compsci-dept
 #SBATCH --nodes=1

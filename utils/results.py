@@ -32,20 +32,27 @@ def _short_model_name(name: str) -> str:
     return MODEL_SHORT_NAMES.get(name, name)
 
 
+# Column order matters: headline ranking metrics first (AUROC/PR-AUC), then
+# calibration (ECE), then threshold-dependent / secondary metrics. Accuracy is
+# de-emphasized because the datasets are class-imbalanced (a majority-class
+# predictor scores high Acc while being useless), so it is NOT the primary metric.
 METRIC_ALIASES = {
+    "roc_auc": "ROC-AUC",
+    "pr_auc": "PR-AUC",
+    "ece": "ECE",
+    "aurc": "AURC",
     "accuracy": "Acc",
+    "f1": "F1",
     "precision": "Prec",
     "recall": "Recall",
-    "ece": "ECE",
     "nll": "NLL",
     "brier": "Brier",
-    "pr_auc": "PR-AUC",
-    "roc_auc": "ROC-AUC",
-    "f1": "F1",
-    "aurc": "AURC",
     "risk_at_80_cov": "Risk@80",
     "risk_at_90_cov": "Risk@90",
 }
+
+# Headline metrics — the primary signals for ranking methods.
+PRIMARY_METRICS = ("ROC-AUC", "PR-AUC", "ECE")
 
 # Reverse map: display name → internal key
 _DISPLAY_TO_KEY = {v: k for k, v in METRIC_ALIASES.items()}
@@ -250,7 +257,68 @@ def _build_tables(
         }
         efficiency_rows.append(eff_row)
 
+    # Append a Majority-class reference row per (Model, scope, ood_dataset) group so
+    # readers can see the trivial Accuracy ceiling on these imbalanced datasets.
+    metric_rows.extend(_majority_rows(report_rows, heads))
+
     return pd.DataFrame(metric_rows), pd.DataFrame(efficiency_rows)
+
+
+def _group_positive_rate(reports: List[Dict[str, Any]]) -> Optional[float]:
+    """Positive(=correct=1) base rate for a group, from any report storing labels."""
+    for row in reports:
+        preds = row["report"].get("predictions")
+        if preds:
+            labels = [int(p.get("trace_label")) for p in preds if p.get("trace_label") is not None]
+            if labels:
+                return sum(labels) / len(labels)
+    return None
+
+
+def _majority_rows(report_rows: Iterable[Dict[str, Any]], heads: Optional[List[str]]) -> List[Dict[str, Any]]:
+    """Build a 'Majority' reference row for each (Model, scope, ood_dataset) group.
+
+    The majority-class predictor always outputs the majority label. On a dataset
+    with positive(correct) rate p:
+        Acc      = max(p, 1-p)            (predict whichever class is larger)
+        ROC-AUC  = 0.5   (no discrimination)
+        PR-AUC   = p     (a constant score => AP equals the positive prevalence)
+        F1/Prec/Recall for the positive class = 0 when negatives are the majority.
+    This exposes how a high Acc can be achieved with zero real skill.
+    """
+    groups: Dict[tuple, List[Dict[str, Any]]] = {}
+    for row in report_rows:
+        if heads and row["head"] not in heads:
+            continue
+        rep = row["report"]
+        model = _short_model_name(rep.get("base_model_name") or "unknown")
+        key = (model, row["dataset_scope"], row["ood_dataset"])
+        groups.setdefault(key, []).append(row)
+
+    rows: List[Dict[str, Any]] = []
+    for (model, scope, ood), members in groups.items():
+        p = _group_positive_rate(members)
+        if p is None:
+            continue
+        majority_is_positive = p >= 0.5
+        acc = max(p, 1.0 - p)
+        row = {
+            "Model": model, "Head": "Majority", "Type": "reference",
+            "N": members[0]["report"].get("total_samples"),
+            "dataset_scope": scope, "ood_dataset": ood,
+        }
+        vals = {
+            "ROC-AUC": 0.5, "PR-AUC": p, "ECE": float("nan"), "AURC": float("nan"),
+            "Acc": acc, "F1": (2 * p / (1 + p)) if majority_is_positive else 0.0,
+            "Prec": p if majority_is_positive else 0.0,
+            "Recall": 1.0 if majority_is_positive else 0.0,
+            "NLL": float("nan"), "Brier": float("nan"),
+            "Risk@80": float("nan"), "Risk@90": float("nan"),
+        }
+        for col in METRIC_ALIASES.values():
+            row[col] = vals.get(col, float("nan"))
+        rows.append(row)
+    return rows
 
 
 def _print_df(df: pd.DataFrame, title: str, digits: int = 4) -> None:

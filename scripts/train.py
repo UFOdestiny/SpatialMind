@@ -123,13 +123,23 @@ def main():
 
     feature_dim = train_ds[0]["features"].shape[-1]
     n_tr, n_cor, n_hall = train_ds.trace_label_stats()
+    n_cl, n_cl_cor, n_cl_hall = train_ds.claim_label_stats()
     log.info("Train traces: %d (%.1f%% correct, %.1f%% hallucination)",
              n_tr, 100 * n_cor / max(n_tr, 1), 100 * n_hall / max(n_tr, 1))
+    log.info("Train claims: %d (%.1f%% correct, %.1f%% hallucination)",
+             n_cl, 100 * n_cl_cor / max(n_cl, 1), 100 * n_cl_hall / max(n_cl, 1))
 
-    # Auto pos_weight for balanced_bce.
-    pos_weight = float(cfg.training.loss_pos_weight)
-    if cfg.training.loss_type == "balanced_bce" and pos_weight <= 0:
-        pos_weight = float(n_hall / max(n_cor, 1))
+    # Auto pos_weight for balanced_bce. The claim and trace tasks have OPPOSITE
+    # class balance, so compute a SEPARATE pos_weight (= n_neg / n_pos) for each.
+    # When loss_pos_weight is set (>0) it overrides both.
+    override = float(cfg.training.loss_pos_weight)
+    if cfg.training.loss_type == "balanced_bce" and override <= 0:
+        claim_pos_weight = float(n_cl_hall / max(n_cl_cor, 1))
+        trace_pos_weight = float(n_hall / max(n_cor, 1))
+    else:
+        claim_pos_weight = trace_pos_weight = max(override, 0.0) or 1.0
+    log.info("balanced_bce pos_weight: claim=%.3f, trace=%.3f (loss_type=%s)",
+             claim_pos_weight, trace_pos_weight, cfg.training.loss_type)
 
     head = build_head(
         head_type=cfg.head.head_type,
@@ -149,7 +159,8 @@ def main():
         head=head,
         num_classes=cfg.head.num_classes,
         loss_type=cfg.training.loss_type,
-        pos_weight=pos_weight,
+        claim_pos_weight=claim_pos_weight,
+        trace_pos_weight=trace_pos_weight,
         focal_gamma=cfg.training.focal_gamma,
         trace_loss_weight=cfg.head.trace_loss_weight,
     ).to(device)

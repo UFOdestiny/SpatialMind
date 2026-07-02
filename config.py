@@ -198,9 +198,13 @@ class TrainingConfig:
     per_device_train_batch_size: int = field(default_factory=lambda: _get_env_int("BATCH_SIZE", 64))
     per_device_eval_batch_size: int = field(default_factory=lambda: _get_env_int("BATCH_SIZE", 64))
     max_grad_norm: float = 1.0
-    # Loss on per-claim logits. bce | balanced_bce | focal.
-    loss_type: str = field(default_factory=lambda: _get_env("LOSS_TYPE", "bce"))
-    loss_pos_weight: float = field(default_factory=lambda: _get_env_float("LOSS_POS_WEIGHT", 1.0))
+    # Loss on per-claim and trace logits. bce | balanced_bce | focal.
+    # Default balanced_bce: the datasets are class-imbalanced (e.g. only ~21-27%
+    # of StepGame traces are correct), so plain BCE collapses toward the majority
+    # class. balanced_bce auto-derives a per-level pos_weight in train.py.
+    loss_type: str = field(default_factory=lambda: _get_env("LOSS_TYPE", "balanced_bce"))
+    # 0 = auto (derive per-level pos_weight from train label balance); >0 overrides.
+    loss_pos_weight: float = field(default_factory=lambda: _get_env_float("LOSS_POS_WEIGHT", 0.0))
     focal_gamma: float = field(default_factory=lambda: _get_env_float("FOCAL_GAMMA", 2.0))
     grad_accum_steps: int = field(default_factory=lambda: _get_env_int("GRAD_ACCUM_STEPS", 1))
     amp_dtype: str = field(default_factory=lambda: _get_env("AMP_DTYPE", "bfloat16"))  # bfloat16 | float16 | float32
@@ -209,7 +213,11 @@ class TrainingConfig:
     metric_for_best_model: str = field(default_factory=lambda: _get_env("BEST_METRIC", "auroc"))
     early_stopping_patience: int = field(default_factory=lambda: _get_env_int("EARLY_STOP_PATIENCE", 8))
     seed: int = GLOBAL_SEED
-    num_workers: int = field(default_factory=lambda: _get_env_int("DATALOADER_NUM_WORKERS", 2))
+    # Parallel data loading to overlap chunk I/O + collate with GPU compute. Each
+    # worker holds MAX_CACHED_CHUNKS chunks, so keep chunks small (GEN_CHUNK_SIZE
+    # ~2500 => ~6-10 GB each): 4 workers x 1 chunk stays well under host mem.
+    # Set to 0 (main process, single shared cache) only for very large chunks.
+    num_workers: int = field(default_factory=lambda: _get_env_int("DATALOADER_NUM_WORKERS", 4))
 
 
 # =============================================================================
@@ -223,7 +231,9 @@ class GenerationConfig:
     temperature: float = 1.0
     batch_size: int = field(default_factory=lambda: _get_env_int("GEN_BATCH_SIZE", 32))
     skip_existing: bool = True
-    chunk_size: int = field(default_factory=lambda: _get_env_int("GEN_CHUNK_SIZE", 10000))
+    # Traces per cache chunk. Keep modest: at feature_dim~4.4k a 10k-trace chunk is
+    # 20-45 GB, which strains host RAM during training. 2500 => ~6-10 GB/chunk.
+    chunk_size: int = field(default_factory=lambda: _get_env_int("GEN_CHUNK_SIZE", 2500))
     save_hidden_states: bool = True
     save_token_probs: bool = True
     save_attention_weights: bool = True
@@ -236,8 +246,16 @@ class GenerationConfig:
 @dataclass
 class VLLMConfig:
     tensor_parallel_size: int = 1
+    # Generation co-hosts a second HF model (for feature extraction) in the same
+    # process, so vLLM must be capped low to leave room for it.
     gpu_memory_utilization: float = field(
         default_factory=lambda: _get_env_float("VLLM_GPU_MEMORY_UTILIZATION", 0.30)
+    )
+    # Text-only workloads (judge / claim extractor) load NO HF model, so vLLM can
+    # use most of the GPU. This must be high enough to fit a large judge (e.g. the
+    # 24B judge's ~45 GiB weights + KV cache) — the low generation cap OOMs it.
+    text_only_gpu_memory_utilization: float = field(
+        default_factory=lambda: _get_env_float("VLLM_TEXT_ONLY_GPU_MEMORY_UTILIZATION", 0.88)
     )
     max_model_len: int = field(default_factory=lambda: _get_env_int("VLLM_MAX_MODEL_LEN", 2048))
     enforce_eager: bool = False

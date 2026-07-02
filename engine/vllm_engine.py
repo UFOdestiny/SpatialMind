@@ -89,11 +89,20 @@ class VLLMGenerationEngine:
         )
         from vllm import LLM, SamplingParams
 
+        # Text-only mode (judge / claim extractor) loads no HF feature model, so it
+        # can claim most of the GPU; generation must stay low to co-host the HF model.
+        gpu_mem_util = (
+            cfg.vllm.text_only_gpu_memory_utilization
+            if self.text_only
+            else cfg.vllm.gpu_memory_utilization
+        )
+        log.info("vLLM gpu_memory_utilization=%.2f (text_only=%s)", gpu_mem_util, self.text_only)
+
         self._vllm_engine = LLM(
             model=model_path,
             tokenizer=model_path,
             tensor_parallel_size=cfg.vllm.tensor_parallel_size,
-            gpu_memory_utilization=cfg.vllm.gpu_memory_utilization,
+            gpu_memory_utilization=gpu_mem_util,
             max_model_len=cfg.vllm.max_model_len,
             enforce_eager=cfg.vllm.enforce_eager,
             swap_space=cfg.vllm.swap_space,

@@ -9,5 +9,6 @@ artifacts/
 
 .vscode
 .claude
+*.log
 spatialmind
 latex

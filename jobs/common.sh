@@ -125,10 +125,10 @@ ALL_HEAD_TYPES=(
 # Training Configuration
 ###############################################################################
 TRAIN_EPOCHS="${TRAIN_EPOCHS:-${NUM_EPOCHS:-40}}"
-TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-${BATCH_SIZE:-64}}"
+TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-${BATCH_SIZE:-512}}"
 TRAIN_LEARNING_RATE="${TRAIN_LEARNING_RATE:-${LEARNING_RATE:-0.0002}}"
-LOSS_TYPE="${LOSS_TYPE:-bce}"                 # bce | balanced_bce | focal
-LOSS_POS_WEIGHT="${LOSS_POS_WEIGHT:-1.0}"
+LOSS_TYPE="${LOSS_TYPE:-balanced_bce}"        # bce | balanced_bce | focal (auto per-level pos_weight)
+LOSS_POS_WEIGHT="${LOSS_POS_WEIGHT:-0}"       # 0 = auto per-level; >0 overrides
 FOCAL_GAMMA="${FOCAL_GAMMA:-2.0}"
 TRACE_LOSS_WEIGHT="${TRACE_LOSS_WEIGHT:-0.5}"  # multi-task trace objective weight
 BEST_METRIC="${BEST_METRIC:-auroc}"            # sample-level model-selection metric
@@ -146,6 +146,15 @@ GEN_BATCH_SIZE="${GEN_BATCH_SIZE:-32}"
 FREE_FORM_GEN_BATCH_SIZE="${FREE_FORM_GEN_BATCH_SIZE:-8}"
 BACKEND="${BACKEND:-vllm}"
 GEN_MAX_NEW_TOKENS="${GEN_MAX_NEW_TOKENS:-256}"
+# Traces per cache chunk. Small => bounded host RAM during training (chunks are
+# tens of GB at full scale). 2500 ~ 6-10 GB/chunk for feature_dim ~4.4k.
+GEN_CHUNK_SIZE="${GEN_CHUNK_SIZE:-2500}"
+# Host-RAM controls for training data loading. With small chunks (GEN_CHUNK_SIZE
+# ~2500 => ~6-10 GB each) parallel workers overlap I/O with GPU compute safely:
+# peak RAM ~ (workers+1) x MAX_CACHED_CHUNKS x chunk. Set workers=0 only for very
+# large chunks (tens of GB). Applies to ALL head trainings.
+DATALOADER_NUM_WORKERS="${DATALOADER_NUM_WORKERS:-4}"
+MAX_CACHED_CHUNKS="${MAX_CACHED_CHUNKS:-1}"
 GEN_MAX_TRAIN="${GEN_MAX_TRAIN:-0}"   # 0 = no limit
 GEN_MAX_VAL="${GEN_MAX_VAL:-0}"
 GEN_MAX_TEST="${GEN_MAX_TEST:-0}"
@@ -178,7 +187,8 @@ setup_environment() {
     export TRAIN_EPOCHS NUM_EPOCHS="${TRAIN_EPOCHS}"
     export BATCH_SIZE="${TRAIN_BATCH_SIZE}" LEARNING_RATE="${TRAIN_LEARNING_RATE}"
     export LOSS_TYPE LOSS_POS_WEIGHT FOCAL_GAMMA TRACE_LOSS_WEIGHT BEST_METRIC
-    export BACKEND GEN_MAX_NEW_TOKENS
+    export BACKEND GEN_MAX_NEW_TOKENS GEN_CHUNK_SIZE
+    export DATALOADER_NUM_WORKERS MAX_CACHED_CHUNKS
 
     # Compiler caches on persistent storage.
     export TORCHINDUCTOR_CACHE_DIR="${CACHE_ROOT}/.torchinductor"

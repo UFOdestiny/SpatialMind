@@ -46,7 +46,7 @@ eval_head() {
     CUDA_VISIBLE_DEVICES="$(_eval_gpu)" "${PYTHON_BIN:-python}" scripts/evaluate.py \
         --head_path "${RESULTS_ROOT}/train/${head_type}/final_model" \
         --cache_dir "${cache_dir}" --output_dir "${out_dir}" \
-        --split test --batch_size "${TRAIN_BATCH_SIZE:-64}" \
+        --split test --batch_size "${TRAIN_BATCH_SIZE:-128}" \
         2>&1 | tee "${log}"
     return ${PIPESTATUS[0]}
 }
@@ -56,7 +56,7 @@ eval_baselines() {
     mkdir -p "${out_dir}" "${LOGS_ROOT}/eval"
     CUDA_VISIBLE_DEVICES="$(_eval_gpu)" "${PYTHON_BIN:-python}" scripts/evaluate.py \
         --cache_dir "${cache_dir}" --output_dir "${out_dir}" \
-        --split test --eval_baselines --batch_size "${TRAIN_BATCH_SIZE:-64}" \
+        --split test --eval_baselines --batch_size "${TRAIN_BATCH_SIZE:-128}" \
         2>&1 | tee "${LOGS_ROOT}/eval/eval_$(basename "${out_dir}")_baselines.log"
     return ${PIPESTATUS[0]}
 }

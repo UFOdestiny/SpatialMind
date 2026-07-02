@@ -13,7 +13,7 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=120gb
+#SBATCH --mem=200gb
 #SBATCH --time=6-23:00:00
 #SBATCH --partition=hpg-b200
 #SBATCH --gres=gpu:1
@@ -37,10 +37,10 @@ train_head() {
         --cache_dir "${CACHE_DIR}" \
         --output_dir "${out}" \
         --num_epochs "${TRAIN_EPOCHS:-40}" \
-        --batch_size "${TRAIN_BATCH_SIZE:-64}" \
+        --batch_size "${TRAIN_BATCH_SIZE:-128}" \
         --learning_rate "${TRAIN_LEARNING_RATE:-0.0002}" \
         --loss_type "${LOSS_TYPE:-bce}" \
-        --loss_pos_weight "${LOSS_POS_WEIGHT:-1.0}" \
+        --loss_pos_weight "${LOSS_POS_WEIGHT:-0}" \
         --focal_gamma "${FOCAL_GAMMA:-2.0}" \
         --trace_loss_weight "${TRACE_LOSS_WEIGHT:-0.5}" \
         2>&1 | tee "${log}"
@@ -76,9 +76,9 @@ run_phase2() {
             CUDA_VISIBLE_DEVICES="${g}" "${PYTHON_BIN:-python}" scripts/train.py \
                 --head_type "${ht}" --cache_dir "${CACHE_DIR}" \
                 --output_dir "${RESULTS_ROOT}/train/${ht}" \
-                --num_epochs "${TRAIN_EPOCHS:-40}" --batch_size "${TRAIN_BATCH_SIZE:-64}" \
+                --num_epochs "${TRAIN_EPOCHS:-40}" --batch_size "${TRAIN_BATCH_SIZE:-128}" \
                 --learning_rate "${TRAIN_LEARNING_RATE:-0.0002}" --loss_type "${LOSS_TYPE:-bce}" \
-                --loss_pos_weight "${LOSS_POS_WEIGHT:-1.0}" --focal_gamma "${FOCAL_GAMMA:-2.0}" \
+                --loss_pos_weight "${LOSS_POS_WEIGHT:-0}" --focal_gamma "${FOCAL_GAMMA:-2.0}" \
                 --trace_loss_weight "${TRACE_LOSS_WEIGHT:-0.5}" \
                 > "${LOGS_ROOT}/train/train_${ht}.log" 2>&1 &
             local pid=$!; pid2head["${pid}"]=${idx}; pid2slot["${pid}"]=${slot}

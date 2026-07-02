@@ -12,8 +12,7 @@
 ###############################################################################
 
 #SBATCH --job-name=smind-ex
-#SBATCH --account=fsu-compsci-dept
-#SBATCH --qos=fsu-compsci-dept
+##SBATCH --account=fsu-compsci-dept
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
@@ -33,7 +32,7 @@ MODEL_NAME="${MODEL_NAME:-Llama-3.1-8B-Instruct}"
 JUDGE_MODEL_NAME="${JUDGE_MODEL_NAME:-Mistral-Small-3.2-24B-Instruct-2506}"
 CACHE_SUBDIR="example"
 TRAIN_EPOCHS="${TRAIN_EPOCHS:-15}"
-TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-64}"
+TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-512}"
 GEN_MAX_TRAIN="${GEN_MAX_TRAIN:-5000}"
 GEN_MAX_VAL="${GEN_MAX_VAL:-2000}"
 GEN_MAX_TEST="${GEN_MAX_TEST:-2000}"

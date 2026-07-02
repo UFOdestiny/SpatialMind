@@ -31,12 +31,19 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Iterator, List, Optional
 
+import os
+
 import torch
 from torch.utils.data import Dataset, Sampler
 
 log = logging.getLogger(__name__)
 
-MAX_CACHED_CHUNKS = 2
+# Number of chunks kept resident in the LRU cache. Chunks can be tens of GB each
+# at full scale (feature_dim ~4.4k x 10k traces), so keep this small. Env-tunable
+# for tight-RAM nodes. With num_workers>0 EACH worker holds its own cache, so the
+# effective RAM is roughly (num_workers+1) x MAX_CACHED_CHUNKS x chunk_size — this
+# is why training defaults to num_workers=0 (see TrainingConfig.num_workers).
+MAX_CACHED_CHUNKS = int(os.environ.get("MAX_CACHED_CHUNKS", "1"))
 PRELOAD_WORKERS = 2
 PENDING = -1
 
