@@ -34,19 +34,37 @@ CHAIN_STAGE1_USER_TEMPLATE = (
     "1=correct, 0=incorrect."
 )
 
-CHAIN_STAGE2_SYSTEM_PROMPT = "You are a strict JSON verifier. Output only valid JSON, nothing else."
+CHAIN_STAGE2_SYSTEM_PROMPT = (
+    "You are a meticulous spatial-reasoning verifier. You check each step of a "
+    "spatial deduction (directions, turns, relative positions, clock-face/compass "
+    "mappings). You first think step by step, then output JSON."
+)
 
-# Optimized prompt: use numbered list + explicit length requirement + example format
+# ANALYSIS-FIRST prompt: the judge must reason about each step BEFORE labeling it.
+# This is the key to real discrimination — without the analysis field the judge
+# rubber-stamps almost every step as correct (validated: only ~2pp gap between
+# correct and incorrect traces). Each step is judged against the question and the
+# preceding steps, NOT against the final answer (LEAKAGE CONTROL: the trace-level
+# verdict is never shown).
 CHAIN_STAGE2_USER_TEMPLATE = (
-    "Task: Verify {num_claims} reasoning claims for consistency.\n\n"
-    "Question: {question}\n"
-    "Model response: {generated_text}\n"
-    "Answer status: {answer_verdict}\n"
-    "Conclusion: {conclusion_claim}\n\n"
-    "Claims to verify:\n{reasoning_claims_numbered}\n\n"
-    "Output format (EXACTLY {num_claims} values): {{\"reasoning_verified\":[{example_output}]}}\n"
-    "- 1 = claim is logically supported by the context\n"
-    "- 0 = claim is unsupported, contradicted, or hallucinated"
+    "Verify each spatial reasoning step below. A step is CORRECT (1) only if it is "
+    "a valid spatial inference given the question and the earlier steps; it is "
+    "INCORRECT (0) if the direction/turn/relative position is wrong, unsupported, "
+    "or contradicts the question. Judge each step on its own spatial merit — do NOT "
+    "assume steps are correct, and do NOT use the final answer.\n\n"
+    "Question: {question}\n\n"
+    "Steps:\n{reasoning_claims_numbered}\n\n"
+    "First, in \"analysis\", briefly check each step's spatial logic (e.g. 'a right "
+    "turn from east faces south, so step 2 is wrong'). Then output the labels.\n"
+    "Output ONLY this JSON (array length EXACTLY {num_claims}, values 0 or 1):\n"
+    "{{\"analysis\": \"<one short check per step>\", "
+    "\"reasoning_verified\": [{example_output}]}}\n\n"
+    "Example — question 'facing north, turn right, turn right, which direction?':\n"
+    "Steps:\n  [0] Start facing north.\n  [1] A right turn from north faces east.\n"
+    "  [2] Another right turn from east faces west.\n"
+    "{{\"analysis\": \"[0] correct start. [1] right from north is east, correct. "
+    "[2] right from east is south not west, incorrect.\", "
+    "\"reasoning_verified\": [1, 1, 0]}}"
 )
 
 
@@ -218,6 +236,29 @@ def parse_chain_stage1_output(response: str) -> Dict[str, Optional[int]]:
     return {
         "answer_label": answer_label,
         "conclusion_verified": conclusion_verified,
+    }
+
+
+def build_chain_stage2_schema(expected_len: int) -> dict:
+    """JSON schema for guided decoding of the Stage-2 reasoning judge.
+
+    Constrains output to {"analysis": str, "reasoning_verified": [0/1 * expected_len]},
+    so the array is ALWAYS the right length with only 0/1 values — no parse
+    failures, no padding/truncation. `analysis` first so the CoT precedes labels.
+    """
+    return {
+        "type": "object",
+        "properties": {
+            "analysis": {"type": "string"},
+            "reasoning_verified": {
+                "type": "array",
+                "items": {"type": "integer", "enum": [0, 1]},
+                "minItems": int(expected_len),
+                "maxItems": int(expected_len),
+            },
+        },
+        "required": ["analysis", "reasoning_verified"],
+        "additionalProperties": False,
     }
 
 

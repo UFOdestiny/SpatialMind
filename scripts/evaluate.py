@@ -9,11 +9,13 @@ know when to trust the model's final spatial answer?
 Protocol (applied identically to supervised heads AND unsupervised baselines):
   1. Score every claim of every test trace (head: sigmoid(claim logit);
      baseline: 1 - uncertainty, min-max normalized with VALIDATION-fit stats).
-  2. Aggregate a trace's claim scores -> one trace score using a rule SELECTED ON
-     VALIDATION (conc / avg / min / mix), shared across all methods. NEVER fit on
-     the test split. In distribution the rule is re-selected on the eval cache's
-     own validation split; under OOD transfer (no target validation cache) it
-     falls back to the train-time / source rule, so test statistics never leak.
+  2. Aggregate a trace's claim scores -> one trace score using a rule FIXED for
+     the whole pipeline (cfg.head.aggregation, default "conc"), shared across all
+     methods, on every split (ID and OOD alike). NEVER fit on the test split, and
+     never re-searched per split/head — a fixed rule keeps the trace-score
+     definition identical everywhere so the comparison measures claim-score
+     quality, not a per-split readout choice. Pass --aggregation auto to restore
+     the legacy per-split validation grid-search over {conc,avg,min,mix}.
   3. Supervised heads that emit a learned trace logit additionally blend it in
      (their multi-task contribution); this is reported alongside the shared rule.
   4. Compute AUROC / PR-AUC / Acc / ECE (+ diagnostics) at the trace level.
@@ -44,6 +46,7 @@ from config import Config
 from data.cached_features import CachedFeatureDataset
 from data.datasets import get_dataset_cls
 from models.aggregation import aggregate_batch, select_aggregation
+from models.calibration import StandardCalibrator, StructuralCalibrator
 from models.heads import build_head
 from models.unsup_heads import build_estimator, UNSUPERVISED_HEAD_REGISTRY
 from models.wrapper import ClaimUQModel
@@ -68,13 +71,49 @@ def parse_args():
     p.add_argument("--batch_size", type=int, default=64)
     p.add_argument("--split", type=str, default="test")
     p.add_argument("--val_split", type=str, default="validation",
-                   help="Split used to (re)select the claim->trace aggregation rule.")
+                   help="Split used to fit the post-hoc calibrator (and, under "
+                        "--aggregation auto, to re-select the aggregation rule).")
+    p.add_argument("--aggregation", type=str, default=None,
+                   help="Claim->trace aggregation rule: conc|avg|min|mix|auto. "
+                        "Defaults to cfg.head.aggregation (fixed, non-'auto' by default). "
+                        "'auto' restores per-split validation grid-search (legacy).")
     p.add_argument("--max_samples", type=int, default=0)
     p.add_argument("--eval_baselines", action="store_true")
     p.add_argument("--baselines", type=str, default=None, help="Comma list; default all.")
     p.add_argument("--save_predictions", action="store_true", default=True)
     p.add_argument("--no_save_predictions", dest="save_predictions", action="store_false")
+    p.add_argument("--calibrate", type=str, default="auto",
+                   choices=["auto", "structural", "standard", "none"],
+                   help="Post-hoc trace-score calibration, FIT ON VALIDATION and applied to test. "
+                        "'auto': structural for spatialmind, standard (Platt) for other heads/baselines.")
+    p.add_argument("--struct_calib_C", type=float, default=0.01,
+                   help="Inverse L2 strength for the structural calibrator (smaller = stronger reg).")
     return p.parse_args()
+
+
+# The head whose per-claim probabilities carry re-orderable structural signal.
+STRUCTURAL_CALIB_HEADS = {"spatialmind"}
+
+
+def _calib_mode_for(head_type: str, requested: str) -> str:
+    """Resolve the calibration mode for a given method under --calibrate=auto."""
+    if requested != "auto":
+        return requested
+    return "structural" if head_type in STRUCTURAL_CALIB_HEADS else "standard"
+
+
+def _conclusion_probs(claim_probs_per_trace, claim_types_per_trace):
+    """Per-trace conclusion-claim probability (last CONCLUSION_TYPE_ID claim, else last)."""
+    from models.aggregation import CONCLUSION_TYPE_ID
+    out = []
+    for cp, ct in zip(claim_probs_per_trace, claim_types_per_trace):
+        cp = np.asarray(cp, dtype=np.float64)
+        if cp.size == 0:
+            out.append(0.5); continue
+        ct = np.asarray(ct)
+        pos = np.where(ct == CONCLUSION_TYPE_ID)[0]
+        out.append(float(cp[pos[-1]] if pos.size else cp[-1]))
+    return out
 
 
 def _read_manifest(cache_dir: str, split: str) -> dict:
@@ -161,18 +200,29 @@ def evaluate_head(args, cfg, cache_dir, output_dir, difficulty_field):
         return _skipped_report("supervised", head_cfg["head_type"],
                                _base_model_name(cache_dir, args.split, cfg), args.split, difficulty_field)
 
-    # Re-select aggregation on the eval cache's own validation split (fair OOD calibration).
+    # Aggregation rule is FIXED for the whole pipeline (cfg.head.aggregation, default
+    # "conc") — the same rule is used on every split (ID and OOD) and every method, so
+    # the trace-score definition never changes underneath the comparison. The
+    # validation split is still loaded (below) to fit the post-hoc calibrator.
+    # --aggregation auto restores the legacy per-split validation grid-search.
+    agg_mode = args.aggregation or cfg.head.aggregation
     aggregation = head_cfg.get("aggregation", {"method": "conc", "mix_weights": None})
+    if agg_mode != "auto":
+        aggregation = {"method": agg_mode, "mix_weights": None}
+    val_preds = None
     try:
         val_ds = CachedFeatureDataset(cache_dir, args.val_split, max_cached_chunks=2)
         val_preds = collect_predictions(model, _make_loader(val_ds, args.batch_size), device, amp_dtype)
-        aggregation = select_aggregation(
-            val_preds["claim_probs"], val_preds["trace_labels"], val_preds["claim_types"],
-            objective="auroc",
-        )
-        log.info("Re-selected aggregation on %s: %s", args.val_split, aggregation)
+        if agg_mode == "auto":
+            aggregation = select_aggregation(
+                val_preds["claim_probs"], val_preds["trace_labels"], val_preds["claim_types"],
+                objective="auroc",
+            )
+            log.info("Re-selected aggregation on %s: %s", args.val_split, aggregation)
+        else:
+            log.info("Using fixed aggregation: %s", aggregation)
     except FileNotFoundError:
-        log.info("No %s split in eval cache; using train-time aggregation: %s", args.val_split, aggregation)
+        log.info("No %s split in eval cache; using aggregation: %s", args.val_split, aggregation)
 
     reset_gpu_peak_memory(device)
     t0 = time.time()
@@ -181,6 +231,32 @@ def evaluate_head(args, cfg, cache_dir, output_dir, difficulty_field):
 
     metrics, trace_scores = score_trace_level(preds, aggregation)
     labels = preds["trace_labels"]
+
+    # ---- Post-hoc calibration: FIT ON VALIDATION, APPLY TO TEST (no leakage) ----
+    calib_mode = _calib_mode_for(head_cfg["head_type"], args.calibrate)
+    calib_info = {"mode": "none", "fit_on": None}
+    if calib_mode != "none" and val_preds is not None and len(np.unique(val_preds["trace_labels"])) >= 2:
+        _, val_scores = score_trace_level(val_preds, aggregation)
+        raw_metrics = dict(metrics)  # keep the pre-calibration metrics for reference
+        if calib_mode == "structural":
+            cal = StructuralCalibrator(C=args.struct_calib_C).fit(
+                val_scores, val_preds["claim_probs"], val_preds["trace_labels"],
+                conclusion_probs=_conclusion_probs(val_preds["claim_probs"], val_preds["claim_types"]),
+            )
+            trace_scores = cal.transform(
+                trace_scores, preds["claim_probs"],
+                conclusion_probs=_conclusion_probs(preds["claim_probs"], preds["claim_types"]),
+            )
+        else:  # standard monotonic Platt
+            cal = StandardCalibrator().fit(val_scores, val_preds["trace_labels"])
+            trace_scores = cal.transform(trace_scores)
+        metrics = compute_all_metrics(labels, trace_scores)
+        calib_info = {"mode": calib_mode, "fit_on": args.val_split, "raw_metrics": raw_metrics}
+        log.info("Calibration[%s] fit on %s: AUROC %.4f->%.4f ECE %.4f->%.4f",
+                 calib_mode, args.val_split, raw_metrics["roc_auc"], metrics["roc_auc"],
+                 raw_metrics["ece"], metrics["ece"])
+    elif calib_mode != "none":
+        log.info("Calibration[%s] skipped: no usable %s split.", calib_mode, args.val_split)
 
     # Claim-level diagnostics (secondary).
     flat_probs, flat_labels, flat_types = [], [], []
@@ -207,6 +283,7 @@ def evaluate_head(args, cfg, cache_dir, output_dir, difficulty_field):
         "total_samples": int(len(labels)),
         "trainable_params": head_cfg.get("trainable_params", 0),
         "aggregation": aggregation,
+        "calibration": calib_info,
         "overall_metrics": metrics,
         "claim_metrics": claim_metrics,
         "per_difficulty_metrics": per_diff,
@@ -328,23 +405,42 @@ def evaluate_baselines(args, cfg, cache_dir, output_dir, difficulty_field, names
             args.val_split, args.split,
         )
 
+    agg_mode = args.aggregation or cfg.head.aggregation
     for name in names:
         estimator = build_estimator(name)
-        # Fit uncertainty->confidence normalization AND select the claim->trace rule
-        # on VALIDATION (never test). Fall back to the eval split only when no
-        # validation cache exists (OOD), which we warned about above.
+        # Fit uncertainty->confidence normalization on VALIDATION (never test).
+        # Fall back to the eval split only when no validation cache exists (OOD),
+        # which we warned about above. The claim->trace rule itself is FIXED
+        # (cfg.head.aggregation, default "conc") unless --aggregation auto is
+        # passed, in which case it is re-selected on the reference split.
         ref_ds = val_ds if val_ds is not None else test_ds
         ref_unc, ref_types, ref_labels, _ = _collect_baseline_uncertainty(estimator, ref_ds)
         norm_stats = _fit_norm_stats(ref_unc)
-        aggregation = {"method": "conc", "mix_weights": None}
+        aggregation = {"method": "conc", "mix_weights": None} if agg_mode == "auto" else {"method": agg_mode, "mix_weights": None}
+        calibrator = None
         if len(ref_labels) > 0 and len(np.unique(ref_labels)) >= 2:
             ref_conf = _uncertainty_to_confidence(ref_unc, norm_stats)
-            aggregation = select_aggregation(ref_conf, ref_labels, ref_types, objective="auroc")
+            if agg_mode == "auto":
+                aggregation = select_aggregation(ref_conf, ref_labels, ref_types, objective="auroc")
+            # Standard (monotonic Platt) calibration for baselines: fit on the
+            # reference (validation) split's trace scores, apply to test. Monotonic
+            # => AUROC/PR-AUC unchanged; only calibration/threshold metrics move.
+            calib_mode = _calib_mode_for(name, args.calibrate)
+            if calib_mode != "none" and val_ds is not None:
+                ref_scores = aggregate_batch(ref_conf, ref_types,
+                                             method=aggregation["method"],
+                                             mix_weights=aggregation.get("mix_weights"))
+                calibrator = StandardCalibrator().fit(ref_scores, ref_labels)
 
         t0 = time.time()
         scores, labels, k_hops, n_claims = _baseline_trace_scores(estimator, test_ds, aggregation, norm_stats)
         infer_s = time.time() - t0
-        metrics = compute_all_metrics(labels, scores)
+        raw_metrics = compute_all_metrics(labels, scores)
+        if calibrator is not None and calibrator.fitted:
+            scores = calibrator.transform(scores)
+            metrics = compute_all_metrics(labels, scores)
+        else:
+            metrics = raw_metrics
         reports[name] = {
             "method_type": "unsupervised",
             "head_type": name,
@@ -354,6 +450,8 @@ def evaluate_baselines(args, cfg, cache_dir, output_dir, difficulty_field, names
             "total_samples": int(len(labels)),
             "aggregation": aggregation,
             "norm_fit_on": args.val_split if val_ds is not None else args.split,
+            "calibration": ({"mode": "standard", "fit_on": args.val_split, "raw_metrics": raw_metrics}
+                            if (calibrator is not None and calibrator.fitted) else {"mode": "none"}),
             "overall_metrics": metrics,
             "per_difficulty_metrics": _per_difficulty(k_hops, labels, scores, difficulty_field),
             "efficiency": {"params_m": 0.0, "inference_s": infer_s,

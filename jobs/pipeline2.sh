@@ -12,7 +12,7 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=16
-#SBATCH --mem=250gb
+#SBATCH --mem=200gb
 #SBATCH --time=6-23:00:00
 #SBATCH --partition=hpg-b200
 #SBATCH --gres=gpu:1

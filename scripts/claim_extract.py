@@ -40,6 +40,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from utils.numpy_compat import (
     configure_protobuf_python_implementation,
     patch_numpy_core_multiarray,
+    silence_transformers_chat_template_warning,
 )
 
 configure_protobuf_python_implementation()
@@ -56,6 +57,7 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
+silence_transformers_chat_template_warning()
 log = logging.getLogger(__name__)
 
 

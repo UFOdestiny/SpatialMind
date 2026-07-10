@@ -36,6 +36,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from utils.numpy_compat import (
     configure_protobuf_python_implementation,
     patch_numpy_core_multiarray,
+    silence_transformers_chat_template_warning,
 )
 
 configure_protobuf_python_implementation()
@@ -47,6 +48,7 @@ from engine import get_engine
 from utils.chain_judge import (
     build_chain_stage1_prompt,
     build_chain_stage2_prompt,
+    build_chain_stage2_schema,
     parse_chain_stage1_output,
     parse_chain_stage2_output,
 )
@@ -56,6 +58,7 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
+silence_transformers_chat_template_warning()
 log = logging.getLogger(__name__)
 
 
@@ -176,7 +179,14 @@ def main():
 
 def _judge_split(cache_dir, split, split_dir, args, engine, judge_model,
                  judge_batch_size, judge_max_new_tokens):
-    """Run judge on a single split. Memory-efficient: processes one chunk at a time."""
+    """Run judge on a single split. Memory-efficient: processes one chunk at a time.
+
+    The conclusion claim label is always tied to the resolved sample label (the
+    final-answer correctness), never the judge's independent semantic verdict —
+    see the conclusion-labeling block below. Reasoning claims are still verified
+    by the judge (Stage 2), since intermediate spatial steps have no deterministic
+    label.
+    """
     chunk_files = sorted(split_dir.glob("chunk_*.pt"))
     if not chunk_files:
         log.info("No chunk files found in %s — skipping.", split_dir)
@@ -315,7 +325,6 @@ def _judge_split(cache_dir, split, split_dir, args, engine, judge_model,
                 for response, (ci, local_idx, conclusion_pos, existing_label, preserve_sample_label) in zip(stage1_outputs, stage1_meta):
                     parsed = parse_chain_stage1_output(response)
                     answer_label = parsed.get("answer_label")
-                    conc_label = parsed.get("conclusion_verified")
                     key = (ci, local_idx)
                     sample = chunk_data[local_idx]
 
@@ -347,10 +356,18 @@ def _judge_split(cache_dir, split, split_dir, args, engine, judge_model,
                         if not isinstance(verified, list) or len(verified) != len(claims):
                             verified = [-1] * len(claims)
                         if conclusion_pos >= 0 and conclusion_pos < len(verified):
-                            if conc_label in (0, 1):
-                                verified[conclusion_pos] = int(conc_label)
-                            elif answer_label in (0, 1):
-                                verified[conclusion_pos] = int(answer_label)
+                            # The conclusion claim asserts "the answer is X"; its
+                            # correctness IS the final-answer correctness. Tie it to the
+                            # resolved sample label for BOTH task types:
+                            #   * classification: sample["label"] = deterministic
+                            #     parse_answer + check_correctness (exact match).
+                            #   * free-form:     sample["label"] = judge answer_label
+                            #     (generated answer aligned with the true sample label).
+                            # Never use the judge's independent semantic conclusion_verified,
+                            # which can decouple the conclusion label from ground truth.
+                            resolved = int(sample.get("label", -1))
+                            if resolved in (0, 1):
+                                verified[conclusion_pos] = resolved
                         sample["verified"] = verified
 
             # ---------------- Stage 2: reasoning chain consistency ----------------
@@ -394,7 +411,23 @@ def _judge_split(cache_dir, split, split_dir, args, engine, judge_model,
                 stage2_meta.append((ci, local_idx, reasoning_positions))
 
             if stage2_prompts:
-                stage2_outputs = engine.generate_text_only(stage2_prompts, judge_max_new_tokens)
+                # Guided decoding: constrain each output to a JSON schema with the
+                # exact reasoning-claim count (values 0/1). Prompts have different
+                # claim counts, so group by count and decode each group with its
+                # schema, then scatter results back to the original order.
+                stage2_outputs = [None] * len(stage2_prompts)
+                by_count = {}
+                for idx, (_, _, r_pos) in enumerate(stage2_meta):
+                    by_count.setdefault(len(r_pos), []).append(idx)
+                for count, idxs in by_count.items():
+                    schema = build_chain_stage2_schema(count) if count > 0 else None
+                    group_out = engine.generate_text_only(
+                        [stage2_prompts[i] for i in idxs],
+                        judge_max_new_tokens,
+                        structured_json_schema=schema,
+                    )
+                    for j, i in enumerate(idxs):
+                        stage2_outputs[i] = group_out[j]
                 stage2_parse_stats = {"exact": 0, "padded": 0, "truncated": 0, "fallback": 0, "inferred": 0, "failed": 0}
                 for response, (ci, local_idx, reasoning_positions) in zip(stage2_outputs, stage2_meta):
                     key = (ci, local_idx)

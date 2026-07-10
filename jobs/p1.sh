@@ -134,6 +134,7 @@ run_judge() {
     "${PYTHON_BIN:-python}" scripts/judge.py \
         --cache_dir "${CACHE_DIR}" --split "${splits}" \
         --judge_model "${JUDGE_MODEL_PATH}" --judge_backend "${BACKEND:-vllm}" \
+        --judge_max_new_tokens "${JUDGE_MAX_NEW_TOKENS:-256}" \
         2>&1 | tee "${LOGS_ROOT}/data/judge_${DATASET_NAME}.log"
     return ${PIPESTATUS[0]}
 }

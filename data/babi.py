@@ -5,6 +5,13 @@ bAbI (Muennighoff/babi) is a free-form QA task. Answers are short strings
 (room names, person names, etc.) with many possible values, so correctness
 is evaluated via LLM-as-judge (needs_judge = True).
 
+The local cache holds all 20 bAbI tasks, but only tasks 17 (positional
+reasoning) and 19 (path finding) are actually spatial-relevant — the other 18
+tasks are supporting-fact/coreference/counting/etc. and dilute the OOD
+spatial-transfer signal. DEFAULT_TASKS below restricts the default OOD split
+to {17, 19} (StepGame's own paper singles these two out as the bAbI subset it
+improves on); pass an explicit k_hop_values to override.
+
 Columns: passage, question, answer, task
 """
 
@@ -29,11 +36,21 @@ SYSTEM_PROMPT = (
     "Keep conclusion as the last line."
 )
 
+# Spatial-relevant bAbI tasks: 17 = positional reasoning, 19 = path finding.
+# The other 18 tasks (supporting-facts, coreference, counting, etc.) are not
+# spatial and would dilute the OOD spatial-transfer signal.
+DEFAULT_TASKS = [17, 19]
+
 
 class BabiDataset(BaseTaskDataset):
     """bAbI QA dataset.
 
     Free-form short answers — requires LLM-as-judge for correctness labeling.
+
+    Unlike the other adapters, k_hop_values=None does NOT mean "all tasks" —
+    it means "use DEFAULT_TASKS (17, 19)", since the local cache holds all 20
+    bAbI tasks but only these two are spatial. Pass an explicit task list
+    (e.g. the full 1-20 range) to override and include non-spatial tasks.
     """
 
     name = "babi"
@@ -44,7 +61,7 @@ class BabiDataset(BaseTaskDataset):
 
     eval_config = {
         "split": "test",
-        "k_hop_values": None,    # evaluate all tasks
+        "k_hop_values": DEFAULT_TASKS,    # spatial-relevant tasks only
         "ood_split": "test",
         "ood_max_samples": 2000,      # cap OOD eval to 2k for efficiency
     }
@@ -68,10 +85,11 @@ class BabiDataset(BaseTaskDataset):
                 raise ValueError(f"Split '{split}' not found. Available: {list(ds.keys())}")
             ds = ds[split]
 
-        # Filter by task (difficulty) if specified
-        if k_hop_values:
-            ds = ds.filter(lambda x: x["task"] in k_hop_values)
-            log.info(f"  Filtered to task={k_hop_values}: {len(ds)} samples")
+        # Default to the spatial-relevant subset (17, 19) when the caller
+        # didn't specify a task filter; pass an explicit list to override.
+        effective_tasks = k_hop_values if k_hop_values else DEFAULT_TASKS
+        ds = ds.filter(lambda x: x["task"] in effective_tasks)
+        log.info(f"  Filtered to task={effective_tasks}: {len(ds)} samples")
 
         # Subsample if requested
         if max_samples > 0 and len(ds) > max_samples:

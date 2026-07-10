@@ -15,6 +15,10 @@ CLAIM_TYPE2ID: Dict[str, int] = {
     "conclusion": 2,
 }
 
+# Sentinel for a claim whose correctness has not yet been assigned. Reasoning
+# claims start pending and are labeled by the Stage-2 reasoning judge.
+PENDING_LABEL: int = -1
+
 
 @dataclass
 class SpatialClaim:
@@ -305,7 +309,12 @@ def extract_claims_from_generation(
             if claim_type == "conclusion":
                 verified = 1 if answer_correct else 0
             else:
-                verified = 1  # reasoning claims default to correct
+                # Reasoning claims are UNLABELED by extraction. They must be
+                # verified by the Stage-2 reasoning judge; leaving them pending
+                # (-1) ensures the judge labels them instead of silently
+                # defaulting to "correct" (which makes claim-level supervision
+                # vacuous). See scripts/judge.py Stage-2.
+                verified = PENDING_LABEL
 
             claims.append(
                 SpatialClaim(
@@ -367,9 +376,10 @@ def extract_claims_from_generation(
         if claim_type == "conclusion":
             verified = 1 if answer_correct else 0
         else:
-            # Reasoning claims from generated chain are treated as correct by default;
-            # judge-based refinement can overwrite this later if needed.
-            verified = 1
+            # Reasoning claims are unlabeled by extraction; the Stage-2 judge
+            # assigns their correctness. Pending (-1) so they are not silently
+            # treated as correct.
+            verified = PENDING_LABEL
 
         claims.append(
             SpatialClaim(
@@ -496,8 +506,12 @@ def extract_claims_from_llm_output(
                 verified = 0
 
         if verified is None:
-            # Default: 1=correct if answer_correct, 0=hallucinated for conclusion if wrong
-            verified = 1 if answer_correct else (0 if ctype == "conclusion" else 1)
+            # Conclusion mirrors answer correctness; reasoning stays pending (-1)
+            # for the Stage-2 judge rather than defaulting to "correct".
+            if ctype == "conclusion":
+                verified = 1 if answer_correct else 0
+            else:
+                verified = PENDING_LABEL
         claims.append(
             SpatialClaim(
                 text=ctext,

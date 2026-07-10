@@ -295,7 +295,12 @@ class VLLMGenerationEngine:
             log_likelihoods=log_ll_out,
         )
 
-    def generate_text_only(self, prompts: List[str], max_new_tokens: int) -> List[str]:
+    def generate_text_only(
+        self,
+        prompts: List[str],
+        max_new_tokens: int,
+        structured_json_schema=None,
+    ) -> List[str]:
         """Generate text without feature extraction (for judge.py).
 
         Uses only the vLLM engine — skips the HF forward pass entirely.
@@ -303,15 +308,31 @@ class VLLMGenerationEngine:
         Args:
             prompts: List of text prompts.
             max_new_tokens: Maximum tokens to generate per prompt.
+            structured_json_schema: Optional JSON schema. When provided, vLLM
+                constrains the output to valid JSON matching the schema (guided
+                decoding) — guarantees exact array length / 0-1 values for the
+                Stage-2 reasoning judge, eliminating parse failures.
 
         Returns:
             List of generated text strings.
         """
-        sampling_params = self._SamplingParams(
-            max_tokens=max_new_tokens,
-            temperature=0,
-            n=1,
-        )
+        sampling_kwargs = {"max_tokens": max_new_tokens, "temperature": 0, "n": 1}
+        if structured_json_schema is not None:
+            try:
+                from vllm.sampling_params import StructuredOutputsParams
+                sampling_kwargs["structured_outputs"] = StructuredOutputsParams(
+                    json=structured_json_schema
+                )
+            except Exception:
+                # Older vLLM: fall back to guided_decoding kwarg, else plain decode.
+                try:
+                    from vllm.sampling_params import GuidedDecodingParams
+                    sampling_kwargs["guided_decoding"] = GuidedDecodingParams(
+                        json=structured_json_schema
+                    )
+                except Exception:
+                    log.warning("vLLM build lacks structured-output support; decoding unconstrained.")
+        sampling_params = self._SamplingParams(**sampling_kwargs)
         vllm_outputs = self._vllm_engine.generate(
             prompts, sampling_params, use_tqdm=False
         )

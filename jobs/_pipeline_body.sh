@@ -26,7 +26,7 @@ if [[ -n "${RESUME_JOB_ID:-}" ]]; then
 fi
 
 read -ra ALL_HEAD_TYPES <<< "${HEAD_TYPES:-${ALL_HEAD_TYPES[*]}}"
-OOD_DATASETS=(); read -r -a OOD_DATASETS <<< "${OOD_DATASETS:-spartqa babi}"
+OOD_DATASETS=(); read -r -a OOD_DATASETS <<< "${OOD_DATASETS:-spartqa babi SpaRTUN SpaceNLI}"
 
 RUN_LOG="${LOGS_ROOT}/pipeline${RESUME_JOB_ID:+_resume}.log"
 mkdir -p "${LOGS_ROOT}"

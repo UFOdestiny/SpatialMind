@@ -8,7 +8,8 @@ artifacts/
 .DS_Store
 
 .vscode
-.claude
+.claude*
 *.log
 spatialmind
 latex
+analysis

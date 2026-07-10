@@ -182,6 +182,7 @@ def main():
         num_workers=cfg.training.num_workers,
         seed=cfg.training.seed,
         device=device,
+        aggregation=cfg.head.aggregation,
     )
     train_time = time.time() - start
     gpu_peak = get_gpu_peak_memory_gb(device)

@@ -167,8 +167,12 @@ class HeadConfig:
     # addition to per-claim logits. `trace_loss_weight` scales the trace-level
     # BCE term added to the per-claim BCE. 0 disables the multi-task head.
     trace_loss_weight: float = field(default_factory=lambda: _get_env_float("TRACE_LOSS_WEIGHT", 0.5))
-    # Default claim->trace aggregation used when a head has no learned trace head.
-    aggregation: str = field(default_factory=lambda: _get_env("AGGREGATION", "mix"))
+    # Claim->trace aggregation rule. FIXED by default (not re-selected per epoch),
+    # because per-epoch grid search over {conc,avg,min,mix} on the small validation
+    # set overfits its noise and picks poorly-calibrated checkpoints. "conc" =
+    # trust the conclusion claim (p_K); robust and interpretable. Set AGGREGATION
+    # to conc|avg|min|mix; "auto" restores end-of-training validation selection.
+    aggregation: str = field(default_factory=lambda: _get_env("AGGREGATION", "conc"))
 
 
 # =============================================================================
@@ -191,7 +195,7 @@ class DatasetConfig:
 # =============================================================================
 @dataclass
 class TrainingConfig:
-    num_epochs: int = field(default_factory=lambda: _get_env_int("NUM_EPOCHS", 40))
+    num_epochs: int = field(default_factory=lambda: _get_env_int("NUM_EPOCHS", 30))
     learning_rate: float = field(default_factory=lambda: _get_env_float("LEARNING_RATE", 2e-4))
     weight_decay: float = 0.01
     warmup_ratio: float = 0.05
@@ -276,7 +280,11 @@ class JudgeConfig:
         default_factory=lambda: f"{MODELS_ROOT}/{_get_env('JUDGE_MODEL_NAME', 'Mistral-Small-3.2-24B-Instruct-2506')}"
     )
     judge_backend: str = field(default_factory=lambda: _get_env("BACKEND", "vllm"))
-    judge_max_new_tokens: int = 64
+    # Stage-2 reasoning verification uses an ANALYSIS-FIRST prompt (the judge writes
+    # a short per-step analysis before the label array), which needs room — 64 was
+    # only enough for the bare array and truncated the analysis. 256 fits the CoT +
+    # array for typical 3-6 step traces.
+    judge_max_new_tokens: int = field(default_factory=lambda: _get_env_int("JUDGE_MAX_NEW_TOKENS", 256))
     judge_batch_size: int = 64
 
 

@@ -60,6 +60,8 @@ CLAIM_EXTRACTOR_MODEL_NAME="${CLAIM_EXTRACTOR_MODEL_NAME:-}"
 CLAIM_EXTRACTOR_BACKEND="${CLAIM_EXTRACTOR_BACKEND:-vllm}"
 CLAIM_EXTRACTOR_MAX_NEW_TOKENS="${CLAIM_EXTRACTOR_MAX_NEW_TOKENS:-256}"
 CLAIM_LABELER_MAX_NEW_TOKENS="${CLAIM_LABELER_MAX_NEW_TOKENS:-128}"
+# Stage-2 reasoning judge uses an analysis-first prompt; needs room for the CoT.
+JUDGE_MAX_NEW_TOKENS="${JUDGE_MAX_NEW_TOKENS:-256}"
 DEFER_CLAIM_EXTRACTION="${DEFER_CLAIM_EXTRACTION:-1}"
 
 # Judge rerun control.
@@ -78,6 +80,8 @@ DOWNLOAD_DATASETS=(
     "StepGame:ZhengyanShi/StepGame"
     "spartqa:tasksource/spartqa-mchoice"
     "babi:facebook/babi_qa"
+    "SpaRTUN:tasksource/SpaRTUN"
+    "SpaceNLI:tasksource/SpaceNLI"
 )
 
 # Cache directory (optionally namespaced by CACHE_SUBDIR, e.g. "example").
@@ -124,8 +128,8 @@ ALL_HEAD_TYPES=(
 ###############################################################################
 # Training Configuration
 ###############################################################################
-TRAIN_EPOCHS="${TRAIN_EPOCHS:-${NUM_EPOCHS:-40}}"
-TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-${BATCH_SIZE:-512}}"
+TRAIN_EPOCHS="${TRAIN_EPOCHS:-${NUM_EPOCHS:-30}}"
+TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-${BATCH_SIZE:-1024}}"
 TRAIN_LEARNING_RATE="${TRAIN_LEARNING_RATE:-${LEARNING_RATE:-0.0002}}"
 LOSS_TYPE="${LOSS_TYPE:-balanced_bce}"        # bce | balanced_bce | focal (auto per-level pos_weight)
 LOSS_POS_WEIGHT="${LOSS_POS_WEIGHT:-0}"       # 0 = auto per-level; >0 overrides
@@ -153,7 +157,7 @@ GEN_CHUNK_SIZE="${GEN_CHUNK_SIZE:-2500}"
 # ~2500 => ~6-10 GB each) parallel workers overlap I/O with GPU compute safely:
 # peak RAM ~ (workers+1) x MAX_CACHED_CHUNKS x chunk. Set workers=0 only for very
 # large chunks (tens of GB). Applies to ALL head trainings.
-DATALOADER_NUM_WORKERS="${DATALOADER_NUM_WORKERS:-4}"
+DATALOADER_NUM_WORKERS="${DATALOADER_NUM_WORKERS:-2}"
 MAX_CACHED_CHUNKS="${MAX_CACHED_CHUNKS:-1}"
 GEN_MAX_TRAIN="${GEN_MAX_TRAIN:-0}"   # 0 = no limit
 GEN_MAX_VAL="${GEN_MAX_VAL:-0}"
@@ -165,7 +169,7 @@ GEN_MAX_OOD_VAL="${GEN_MAX_OOD_VAL:-${GEN_MAX_OOD}}"  # OOD validation (calibrat
 # OOD Evaluation Configuration
 ###############################################################################
 # In-distribution training set is StepGame; OOD transfer targets:
-OOD_DATASETS="${OOD_DATASETS:-spartqa babi}"
+OOD_DATASETS="${OOD_DATASETS:-spartqa babi SpaRTUN SpaceNLI}"
 
 ###############################################################################
 # Environment Setup
@@ -182,7 +186,7 @@ setup_environment() {
 
     # Export path + hyperparameter env vars so config.py resolves identically.
     export SPATIALMIND_ROOT MODELS_ROOT DATASETS_ROOT RESULTS_ROOT LOGS_ROOT CACHE_ROOT HF_CACHE
-    export MODEL_NAME DATASET_NAME JUDGE_MODEL_NAME
+    export MODEL_NAME DATASET_NAME JUDGE_MODEL_NAME JUDGE_MAX_NEW_TOKENS
     export VLLM_GPU_MEMORY_UTILIZATION VLLM_MAX_MODEL_LEN
     export TRAIN_EPOCHS NUM_EPOCHS="${TRAIN_EPOCHS}"
     export BATCH_SIZE="${TRAIN_BATCH_SIZE}" LEARNING_RATE="${TRAIN_LEARNING_RATE}"
@@ -295,6 +299,17 @@ manifest_total_pending() {
     echo "${p}"
 }
 
+# Pending CLAIM labels (verified == -1), e.g. reasoning claims awaiting Stage-2.
+# Distinct from sample-level total_pending: an exact-match dataset has
+# total_pending=0 but total_claim_pending>0 until the reasoning judge runs.
+manifest_total_claim_pending() {
+    local manifest="$1/$2/manifest.json"
+    [[ -f "${manifest}" ]] || return 1
+    local p; p=$(grep -o '"total_claim_pending"[[:space:]]*:[[:space:]]*[0-9]\+' "${manifest}" | head -n1 | grep -o '[0-9]\+' || true)
+    [[ -n "${p}" ]] || return 1
+    echo "${p}"
+}
+
 should_run_judge_for_splits() {
     local cache_dir="$1" splits_csv="$2" context="${3:-Judge}" ignore_force="${4:-0}"
     local threshold="${JUDGE_PENDING_SKIP_THRESHOLD:-0}"
@@ -311,10 +326,21 @@ should_run_judge_for_splits() {
         if ! pending=$(manifest_total_pending "${cache_dir}" "${split}"); then
             echo "  [JUDGE] ${context}/${split}: no total_pending, will run judge."; return 0
         fi
+        # Also trigger on pending CLAIM labels (reasoning claims awaiting Stage-2),
+        # which are the common case for exact-match datasets (sample pending=0).
+        local claim_pending
+        if claim_pending=$(manifest_total_claim_pending "${cache_dir}" "${split}"); then
+            if [[ "${claim_pending}" -gt "${threshold}" ]]; then
+                echo "  [JUDGE] ${context}/${split}: claim_pending=${claim_pending} > ${threshold}, will run judge."; return 0
+            fi
+        else
+            # Legacy manifest without the key: run judge to be safe.
+            echo "  [JUDGE] ${context}/${split}: no total_claim_pending key, will run judge."; return 0
+        fi
         if [[ "${pending}" -gt "${threshold}" ]]; then
             echo "  [JUDGE] ${context}/${split}: pending=${pending} > ${threshold}, will run judge."; return 0
         fi
-        echo "  [JUDGE] ${context}/${split}: pending=${pending} <= ${threshold}, skip."
+        echo "  [JUDGE] ${context}/${split}: pending=${pending}, claim_pending=${claim_pending} <= ${threshold}, skip."
     done
     return 1
 }

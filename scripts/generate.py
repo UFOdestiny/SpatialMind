@@ -39,6 +39,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from utils.numpy_compat import (
     configure_protobuf_python_implementation,
     patch_numpy_core_multiarray,
+    silence_transformers_chat_template_warning,
 )
 from utils.chain_judge import (
     build_chain_stage1_prompt,
@@ -53,7 +54,7 @@ patch_numpy_core_multiarray()
 import torch
 
 from config import Config, GLOBAL_SEED
-from data.claims import CLAIM_TYPE2ID, extract_claims_from_generation, extract_claims_from_llm_output
+from data.claims import CLAIM_TYPE2ID, PENDING_LABEL, extract_claims_from_generation, extract_claims_from_llm_output
 from data.datasets import get_dataset
 from models.features.hidden_states import HiddenStateExtractor
 from models.features.token_probs import TokenProbExtractor
@@ -66,6 +67,7 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
+silence_transformers_chat_template_warning()
 log = logging.getLogger(__name__)
 
 JUDGE_SYSTEM_PROMPT = (
@@ -360,12 +362,15 @@ def _ensure_reasoning_conclusion_contract(
         c["claim_type"] = ctype
         c["claim_type_id"] = CLAIM_TYPE2ID.get(ctype, 2)
         filtered_claims.append(c)
-        v = verified[i] if i < len(verified) else 1  # Default to 1 (correct)
+        # Preserve labels including the pending sentinel (-1): reasoning claims are
+        # unlabeled until the Stage-2 judge runs. Only 0/1 are final labels; anything
+        # else (missing / unparseable) becomes pending so the judge will label it.
+        v = verified[i] if i < len(verified) else PENDING_LABEL
         try:
             iv = int(v)
         except Exception:
-            iv = 1
-        filtered_verified.append(1 if iv == 1 else 0)
+            iv = PENDING_LABEL
+        filtered_verified.append(iv if iv in (0, 1) else PENDING_LABEL)
 
     claim_dicts = filtered_claims
     verified = filtered_verified
@@ -716,14 +721,16 @@ def generate_split(
                     for out_text, bi in zip(stage1_outputs, stage1_indices):
                         st1 = parse_chain_stage1_output(out_text)
                         answer_label = st1.get("answer_label")
-                        conc_verified = st1.get("conclusion_verified")
                         if answer_label in (0, 1):
                             stage1_answer_labels[bi] = int(answer_label)
                             per_sample_rows[bi]["label"] = int(answer_label)
                             per_sample_rows[bi]["answer_correct"] = bool(int(answer_label) == 1)
+                        # Conclusion claim correctness IS the final-answer correctness:
+                        # tie it to the resolved answer label, not the judge's independent
+                        # semantic conclusion_verified verdict.
                         cpos = stage1_conclusion_pos.get(bi, -1)
-                        if cpos >= 0 and cpos < len(per_sample_verified[bi]) and conc_verified in (0, 1):
-                            per_sample_verified[bi][cpos] = int(conc_verified)
+                        if cpos >= 0 and cpos < len(per_sample_verified[bi]) and answer_label in (0, 1):
+                            per_sample_verified[bi][cpos] = int(answer_label)
                 except Exception as e:
                     log.warning(
                         "Stage-1 chain judge failed for batch %d-%d (%s); keeping existing labels.",
@@ -832,7 +839,6 @@ def generate_split(
                     for out_text, bi in zip(stage1_outputs, judge_indices):
                         st1 = parse_chain_stage1_output(out_text)
                         answer_label = st1.get("answer_label")
-                        conc_verified = st1.get("conclusion_verified")
                         if answer_label in (0, 1):
                             per_sample_rows[bi]["label"] = int(answer_label)
                             per_sample_rows[bi]["answer_correct"] = bool(int(answer_label) == 1)
@@ -841,11 +847,13 @@ def generate_split(
                             inline_judge_unparseable += 1
                             continue
 
-                        # Apply strict conclusion supervision from stage-1.
+                        # Conclusion claim correctness IS the final-answer correctness:
+                        # tie it to the resolved answer label, not the judge's independent
+                        # semantic conclusion_verified verdict.
                         for ci, c in enumerate(per_sample_claims[bi] or []):
                             if str(c.get("claim_type", "")).strip().lower() == "conclusion":
-                                if conc_verified in (0, 1) and ci < len(per_sample_verified[bi]):
-                                    per_sample_verified[bi][ci] = int(conc_verified)
+                                if ci < len(per_sample_verified[bi]):
+                                    per_sample_verified[bi][ci] = int(answer_label)
                                 break
 
                         # Build stage-2 prompts for reasoning chain checks.
@@ -1056,14 +1064,21 @@ def generate_split(
     correct_rate = total_correct / max(total_labeled, 1)
     incorrect_rate = total_incorrect / max(total_labeled, 1)
     
-    # Collect chunk sample counts for resume validation
+    # Collect chunk sample counts for resume validation, and count pending claims
+    # (verified == -1). Reasoning claims are pending after extraction and must be
+    # labeled by the Stage-2 judge, so total_claim_pending drives judge scheduling.
     chunk_sample_counts = []
+    total_claim_pending = 0
     for ci in range(chunk_idx):
         cp = split_dir / f"chunk_{ci}.pt"
         if cp.exists():
             try:
                 data = torch.load(cp, map_location="cpu", weights_only=False)
                 chunk_sample_counts.append(len(data))
+                for s in data:
+                    total_claim_pending += sum(
+                        1 for v in s.get("verified", []) if int(v) == -1
+                    )
             except Exception:
                 chunk_sample_counts.append(-1)  # Invalid chunk
         else:
@@ -1096,6 +1111,7 @@ def generate_split(
         "total_correct": total_correct,
         "total_incorrect": total_incorrect,
         "total_pending": total_pending,
+        "total_claim_pending": total_claim_pending,
         "claim_label_consistency_overrides": int(consistency_overrides),
         "claim_labeler_supervised_overrides": int(claim_labeler_supervised_overrides),
         "claim_labeler_max_new_tokens": (

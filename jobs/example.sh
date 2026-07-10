@@ -12,11 +12,11 @@
 ###############################################################################
 
 #SBATCH --job-name=smind-ex
-##SBATCH --account=fsu-compsci-dept
+#SBATCH --account=fsu-compsci-dept
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=120gb
+#SBATCH --mem=200gb
 #SBATCH --time=6-23:00:00
 #SBATCH --partition=hpg-b200
 #SBATCH --gres=gpu:1
@@ -31,18 +31,18 @@ DATASET_NAME="${DATASET_NAME:-StepGame}"
 MODEL_NAME="${MODEL_NAME:-Llama-3.1-8B-Instruct}"
 JUDGE_MODEL_NAME="${JUDGE_MODEL_NAME:-Mistral-Small-3.2-24B-Instruct-2506}"
 CACHE_SUBDIR="example"
-TRAIN_EPOCHS="${TRAIN_EPOCHS:-15}"
-TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-512}"
-GEN_MAX_TRAIN="${GEN_MAX_TRAIN:-5000}"
-GEN_MAX_VAL="${GEN_MAX_VAL:-2000}"
-GEN_MAX_TEST="${GEN_MAX_TEST:-2000}"
-GEN_MAX_OOD="${GEN_MAX_OOD:-2000}"
+TRAIN_EPOCHS="${TRAIN_EPOCHS:-30}"
+TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-1024}"
+GEN_MAX_TRAIN="${GEN_MAX_TRAIN:-20000}"
+GEN_MAX_VAL="${GEN_MAX_VAL:-5000}"
+GEN_MAX_TEST="${GEN_MAX_TEST:-5000}"
+GEN_MAX_OOD="${GEN_MAX_OOD:-5000}"
 # Quick-test head subset (full zoo runs in pipeline*.sh).
 HEAD_TYPES="${HEAD_TYPES:-spatialmind uhead saplma factoscope lookback_lens luh_light mlp}"
 
 source "${SCRIPT_DIR}/common.sh"
 read -ra ALL_HEAD_TYPES <<< "${HEAD_TYPES}"
-OOD_DATASETS=(); read -r -a OOD_DATASETS <<< "${OOD_DATASETS:-spartqa babi}"
+OOD_DATASETS=(); read -r -a OOD_DATASETS <<< "${OOD_DATASETS:-spartqa babi SpaRTUN SpaceNLI}"
 
 RUN_LOG="${LOGS_ROOT}/example.log"; mkdir -p "${LOGS_ROOT}"
 exec > >(tee -a "${RUN_LOG}") 2>&1

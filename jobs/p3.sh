@@ -47,6 +47,7 @@ eval_head() {
         --head_path "${RESULTS_ROOT}/train/${head_type}/final_model" \
         --cache_dir "${cache_dir}" --output_dir "${out_dir}" \
         --split test --batch_size "${TRAIN_BATCH_SIZE:-128}" \
+        --calibrate "${CALIBRATE:-auto}" --struct_calib_C "${STRUCT_CALIB_C:-0.01}" \
         2>&1 | tee "${log}"
     return ${PIPESTATUS[0]}
 }
@@ -57,6 +58,7 @@ eval_baselines() {
     CUDA_VISIBLE_DEVICES="$(_eval_gpu)" "${PYTHON_BIN:-python}" scripts/evaluate.py \
         --cache_dir "${cache_dir}" --output_dir "${out_dir}" \
         --split test --eval_baselines --batch_size "${TRAIN_BATCH_SIZE:-128}" \
+        --calibrate "${CALIBRATE:-auto}" --struct_calib_C "${STRUCT_CALIB_C:-0.01}" \
         2>&1 | tee "${LOGS_ROOT}/eval/eval_$(basename "${out_dir}")_baselines.log"
     return ${PIPESTATUS[0]}
 }
@@ -104,6 +106,7 @@ prepare_ood_cache() {
         "${PYTHON_BIN:-python}" scripts/judge.py \
             --cache_dir "${ood_cache}" --split "${ood_splits}" \
             --judge_model "${JUDGE_MODEL_PATH}" --judge_backend "${BACKEND:-vllm}" \
+            --judge_max_new_tokens "${JUDGE_MAX_NEW_TOKENS:-256}" \
             2>&1 | tee "${LOGS_ROOT}/data/judge_ood_${ood}.log"
     fi
 }

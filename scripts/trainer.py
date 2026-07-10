@@ -169,6 +169,7 @@ def train_loop(
     num_workers: int,
     seed: int,
     device: torch.device,
+    aggregation: str = "conc",
     on_epoch_end=None,
 ) -> TrainState:
     amp_dtype = _amp_dtype(amp_dtype_name)
@@ -229,10 +230,16 @@ def train_loop(
 
         # ----- validation (sample-level) -----
         preds = collect_predictions(model, val_loader, device, amp_dtype)
-        agg = select_aggregation(
-            preds["claim_probs"], preds["trace_labels"], preds["claim_types"],
-            objective="prauc" if metric_for_best_model == "pr_auc" else "auroc",
-        )
+        # FIXED aggregation during model selection (default) — avoids overfitting
+        # the small val set by re-searching the rule every epoch. "auto" opts into
+        # per-epoch validation selection (legacy behavior).
+        if aggregation == "auto":
+            agg = select_aggregation(
+                preds["claim_probs"], preds["trace_labels"], preds["claim_types"],
+                objective="prauc" if metric_for_best_model == "pr_auc" else "auroc",
+            )
+        else:
+            agg = {"method": aggregation, "mix_weights": None}
         val_metrics, _ = score_trace_level(preds, agg, objective=metric_for_best_model)
         metric_key = {"auroc": "roc_auc", "pr_auc": "pr_auc", "prauc": "pr_auc"}.get(
             metric_for_best_model, "roc_auc"
