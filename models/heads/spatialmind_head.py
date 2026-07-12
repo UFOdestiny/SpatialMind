@@ -39,12 +39,16 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from models.heads.base import UncertaintyHeadBase
+from spatial_constraints import CLAIM_CONSTRAINT_DIM, TRACE_CONSTRAINT_DIM
+from spatial_constraints import CLAIM_FEATURE_NAMES, TRACE_FEATURE_NAMES
 
 REASONING_TYPE_ID = 1
 CONCLUSION_TYPE_ID = 2
 _NUM_CLAIM_TYPES = 3  # {0 unused, 1 reasoning, 2 conclusion}
 _MAX_CLAIM_POS = 64
 _NUM_RELIABILITY_PROTOTYPES = 4
+_CF = {name: i for i, name in enumerate(CLAIM_FEATURE_NAMES)}
+_TF = {name: i for i, name in enumerate(TRACE_FEATURE_NAMES)}
 
 
 class SpatialMindHead(UncertaintyHeadBase):
@@ -66,6 +70,8 @@ class SpatialMindHead(UncertaintyHeadBase):
         use_cross_claim: bool = True,
         use_scope: bool = True,
         use_type: bool = True,
+        use_explicit_constraints: bool = False,
+        constraint_ablation: Optional[str] = None,
         **kwargs,
     ):
         super().__init__(feature_dim, num_classes)
@@ -75,6 +81,8 @@ class SpatialMindHead(UncertaintyHeadBase):
         self.use_cross_claim = use_cross_claim
         self.use_scope = use_scope
         self.use_type = use_type
+        self.use_explicit_constraints = bool(use_explicit_constraints)
+        self.constraint_ablation = constraint_ablation
 
         # 1. Token projection.
         self.input_norm = nn.LayerNorm(feature_dim)
@@ -137,6 +145,50 @@ class SpatialMindHead(UncertaintyHeadBase):
                 nn.Linear(head_dim, head_dim),
             )
 
+        # Explicit relation-algebra branch. It consumes satisfiability,
+        # entailment, first-conflict, and repair features computed from the
+        # canonical spatial constraint graph in Phase 1.
+        if self.use_explicit_constraints:
+            claim_mask = torch.ones(CLAIM_CONSTRAINT_DIM)
+            trace_mask = torch.ones(TRACE_CONSTRAINT_DIM)
+            if constraint_ablation == "no_context":
+                claim_mask[[3, 4, 14]] = 0
+                trace_mask[[0, 1, 5]] = 0
+            elif constraint_ablation == "no_conflict":
+                # Prefix/whole-layout satisfiability and conflict localization.
+                # Keep three-way entailment status and repair cost for separate
+                # leave-one-signal-out controls below.
+                claim_mask[[5, 6, 10]] = 0
+                trace_mask[[6, 10]] = 0
+            elif constraint_ablation == "no_entailment":
+                claim_mask[[7, 8, 9]] = 0
+                trace_mask[[7, 8, 9, 13, 14, 15]] = 0
+            elif constraint_ablation == "no_repair":
+                claim_mask[[11]] = 0
+                trace_mask[[11, 12]] = 0
+            self.register_buffer("constraint_claim_feature_mask", claim_mask, persistent=False)
+            self.register_buffer("constraint_trace_feature_mask", trace_mask, persistent=False)
+            self.constraint_claim_encoder = nn.Sequential(
+                nn.Linear(CLAIM_CONSTRAINT_DIM, head_dim), nn.LayerNorm(head_dim),
+                nn.GELU(), nn.Dropout(dropout), nn.Linear(head_dim, head_dim),
+            )
+            self.constraint_trace_encoder = nn.Sequential(
+                nn.Linear(TRACE_CONSTRAINT_DIM, head_dim), nn.LayerNorm(head_dim),
+                nn.GELU(), nn.Dropout(dropout), nn.Linear(head_dim, head_dim),
+            )
+            self.constraint_gate = nn.Linear(head_dim * 4, head_dim)
+            # The exact solver remains an auditable prior, while a direct
+            # constraint branch is the primary learned logit. The much larger
+            # neural path is restricted to a bounded residual so it cannot wash
+            # out the explicit structural signal.
+            self.constraint_direct_residual = nn.Sequential(
+                nn.Linear(CLAIM_CONSTRAINT_DIM + TRACE_CONSTRAINT_DIM, head_dim),
+                nn.LayerNorm(head_dim), nn.GELU(), nn.Dropout(dropout),
+                nn.Linear(head_dim, num_classes),
+            )
+            self.constraint_residual_scale_raw = nn.Parameter(torch.tensor(-2.0))
+            self.constraint_neural_residual_scale_raw = nn.Parameter(torch.tensor(-2.0))
+
         # 7. Per-claim scoring head.
         # input = [prototype ; reliability state ; global gap ; type]
         self.claim_scorer = nn.Sequential(
@@ -146,12 +198,14 @@ class SpatialMindHead(UncertaintyHeadBase):
 
         # 8. Multi-task trace read-out.
         # Aggregates claim states (attention-pooled) + global anchor + conclusion state.
-        self.trace_query = nn.Parameter(torch.randn(1, head_dim) * 0.02)
-        self.trace_attn = nn.Linear(head_dim, 1)
-        self.trace_scorer = nn.Sequential(
-            nn.Linear(head_dim * 3, head_dim), nn.LayerNorm(head_dim), nn.GELU(),
-            nn.Dropout(dropout), nn.Linear(head_dim, num_classes),
-        )
+        if self.emits_trace_logit:
+            self.trace_query = nn.Parameter(torch.randn(1, head_dim) * 0.02)
+            self.trace_attn = nn.Linear(head_dim, 1)
+            trace_input_dim = head_dim * (4 if self.use_explicit_constraints else 3)
+            self.trace_scorer = nn.Sequential(
+                nn.Linear(trace_input_dim, head_dim), nn.LayerNorm(head_dim), nn.GELU(),
+                nn.Dropout(dropout), nn.Linear(head_dim, num_classes),
+            )
 
         self._init_weights()
         # Cache of per-claim reliability states from the last forward_claims call,
@@ -171,7 +225,8 @@ class SpatialMindHead(UncertaintyHeadBase):
                     elif "bias" in name:
                         nn.init.zeros_(p)
         nn.init.normal_(self.cls_token, std=0.02)
-        nn.init.normal_(self.trace_query, std=0.02)
+        if hasattr(self, "trace_query"):
+            nn.init.normal_(self.trace_query, std=0.02)
 
     # ------------------------------------------------------------------ #
     def _scope_descriptor(self, claim_mask: torch.Tensor, valid_len: float) -> torch.Tensor:
@@ -201,6 +256,8 @@ class SpatialMindHead(UncertaintyHeadBase):
         attention_mask: torch.Tensor,
         claim_masks: List[torch.Tensor],
         claim_types: Optional[List[torch.Tensor]] = None,
+        claim_constraint_features: Optional[List[torch.Tensor]] = None,
+        trace_constraint_features: Optional[torch.Tensor] = None,
     ) -> List[torch.Tensor]:
         """Fully-batched claim scoring.
 
@@ -320,10 +377,75 @@ class SpatialMindHead(UncertaintyHeadBase):
         else:
             reliab = seed
 
+        constraint_trace_embed = None
+        if self.use_explicit_constraints:
+            if claim_constraint_features is None or trace_constraint_features is None:
+                raise ValueError("explicit-constraint SpatialMind requires native constraint cache fields")
+            cf_rows = []
+            for i, c in enumerate(counts):
+                if c <= 0:
+                    continue
+                cf = claim_constraint_features[i].to(device=device, dtype=torch.float32)
+                if cf.shape != (c, CLAIM_CONSTRAINT_DIM):
+                    raise ValueError(
+                        f"trace {i}: expected claim constraints {(c, CLAIM_CONSTRAINT_DIM)}, got {tuple(cf.shape)}"
+                    )
+                cf_rows.append(cf)
+            cf_all = torch.cat(cf_rows, dim=0).to(dtype=reliab.dtype)
+            cf_all = cf_all * self.constraint_claim_feature_mask.to(device=device, dtype=cf_all.dtype)
+            c_state = self.constraint_claim_encoder(cf_all)
+            constraint_trace_embed = self.constraint_trace_encoder(
+                trace_constraint_features.to(device=device, dtype=torch.float32)
+                * self.constraint_trace_feature_mask.to(device=device, dtype=torch.float32)
+            ).to(dtype=reliab.dtype)
+            trace_state_per_claim = constraint_trace_embed[trace_idx]
+            c_gate = torch.sigmoid(self.constraint_gate(
+                torch.cat([reliab, c_state, trace_state_per_claim, anchor], dim=-1)
+            ))
+            # Residual gated fusion preserves the neural probe while injecting
+            # both claim-local and trace-global exact structural signals.
+            reliab = reliab + c_gate * (c_state + trace_state_per_claim)
+
         # ---- 7. Per-claim logit ----
         reliab_gap = torch.abs(reliab - anchor)
         logits_all = self.claim_scorer(
             torch.cat([prototype, reliab, reliab_gap, type_vec], dim=-1))  # (T, C)
+        if self.use_explicit_constraints and self.num_classes == 1:
+            # Claim-local exact reliability energy.
+            claim_prior = (
+                0.45
+                + 0.25 * cf_all[:, _CF["entailed"]]
+                - 0.35 * cf_all[:, _CF["contradicted"]]
+                - 0.05 * cf_all[:, _CF["unknown"]]
+                + 0.10 * cf_all[:, _CF["feasible_with_claim"]]
+                + 0.05 * cf_all[:, _CF["parseable"]]
+            )
+            tf_all = (
+                trace_constraint_features.to(device=device, dtype=torch.float32)
+                * self.constraint_trace_feature_mask.to(device=device, dtype=torch.float32)
+            ).to(dtype=logits_all.dtype)
+            trace_prior = (
+                0.45
+                + 0.20 * tf_all[:, _TF["full_trace_feasible"]]
+                + 0.20 * tf_all[:, _TF["conclusion_entailed"]]
+                - 0.30 * tf_all[:, _TF["conclusion_contradicted"]]
+                - 0.25 * tf_all[:, _TF["contradiction_rate"]]
+                + 0.05 * tf_all[:, _TF["parse_rate"]]
+            )
+            prior = torch.where(
+                t_all == CONCLUSION_TYPE_ID, trace_prior[trace_idx], claim_prior
+            ).clamp(0.02, 0.98)
+            exact_logit = torch.logit(prior).unsqueeze(-1)
+            direct_residual = self.constraint_direct_residual(torch.cat([
+                cf_all.to(dtype=logits_all.dtype), tf_all[trace_idx],
+            ], dim=-1))
+            exact_scale = F.softplus(self.constraint_residual_scale_raw)
+            neural_scale = F.softplus(self.constraint_neural_residual_scale_raw)
+            logits_all = (
+                direct_residual
+                + exact_scale * exact_logit
+                + neural_scale * torch.tanh(logits_all)
+            )
 
         # ---- Split back to per-trace, cache states for the trace read-out. ----
         per_trace_logits: List[torch.Tensor] = []
@@ -338,7 +460,12 @@ class SpatialMindHead(UncertaintyHeadBase):
             sl = slice(offset, offset + c)
             per_trace_logits.append(logits_all[sl])
             self._cached_states.append(
-                {"reliab": reliab[sl], "type": t_all[sl], "anchor": global_anchor[i]})
+                {
+                    "reliab": reliab[sl], "type": t_all[sl], "anchor": global_anchor[i],
+                    "constraint_trace": (
+                        constraint_trace_embed[i] if constraint_trace_embed is not None else None
+                    ),
+                })
             offset += c
         return per_trace_logits
 
@@ -378,6 +505,8 @@ class SpatialMindHead(UncertaintyHeadBase):
         claim_logits_per_trace: List[torch.Tensor],
         claim_masks: List[torch.Tensor],
         claim_types: Optional[List[torch.Tensor]] = None,
+        claim_constraint_features: Optional[List[torch.Tensor]] = None,
+        trace_constraint_features: Optional[torch.Tensor] = None,
     ) -> Optional[torch.Tensor]:
         """Learned trace-level logit from cached per-claim reliability states."""
         device = features.device
@@ -397,8 +526,87 @@ class SpatialMindHead(UncertaintyHeadBase):
             conc_positions = (t == CONCLUSION_TYPE_ID).nonzero(as_tuple=False).flatten()
             conc_idx = int(conc_positions[-1].item()) if conc_positions.numel() else reliab.shape[0] - 1
             conc_state = reliab[conc_idx]
-            trace_logit = self.trace_scorer(torch.cat([pooled, conc_state, anchor], dim=-1))
+            parts = [pooled, conc_state, anchor]
+            if self.use_explicit_constraints:
+                c_trace = st.get("constraint_trace")
+                if c_trace is None:
+                    raise ValueError("missing cached trace-constraint state")
+                parts.append(c_trace)
+            trace_logit = self.trace_scorer(torch.cat(parts, dim=-1))
             outs.append(trace_logit)
         if not outs:
             return torch.zeros(0, self.num_classes, device=device)
         return torch.stack(outs, dim=0)
+
+
+class ConstraintSpatialMindHead(SpatialMindHead):
+    """Novel hybrid: frozen LLM representations + explicit layout constraints."""
+
+    supports_constraint_inputs = True
+    emits_trace_logit = False
+
+    def __init__(self, feature_dim, num_classes=1, **kwargs):
+        kwargs["use_explicit_constraints"] = True
+        super().__init__(feature_dim, num_classes, **kwargs)
+
+
+class NeuralSpatialMindHead(SpatialMindHead):
+    """Ablation retaining the previous implicit neural-consistency probe only."""
+
+    supports_constraint_inputs = False
+    emits_trace_logit = False
+
+    def __init__(self, feature_dim, num_classes=1, **kwargs):
+        kwargs["use_explicit_constraints"] = False
+        super().__init__(feature_dim, num_classes, **kwargs)
+
+
+class ConstraintNoContextHead(ConstraintSpatialMindHead):
+    def __init__(self, feature_dim, num_classes=1, **kwargs):
+        kwargs["constraint_ablation"] = "no_context"
+        super().__init__(feature_dim, num_classes, **kwargs)
+
+
+class ConstraintNoConflictHead(ConstraintSpatialMindHead):
+    def __init__(self, feature_dim, num_classes=1, **kwargs):
+        kwargs["constraint_ablation"] = "no_conflict"
+        super().__init__(feature_dim, num_classes, **kwargs)
+
+
+class ConstraintNoEntailmentHead(ConstraintSpatialMindHead):
+    def __init__(self, feature_dim, num_classes=1, **kwargs):
+        kwargs["constraint_ablation"] = "no_entailment"
+        super().__init__(feature_dim, num_classes, **kwargs)
+
+
+class ConstraintNoRepairHead(ConstraintSpatialMindHead):
+    def __init__(self, feature_dim, num_classes=1, **kwargs):
+        kwargs["constraint_ablation"] = "no_repair"
+        super().__init__(feature_dim, num_classes, **kwargs)
+
+
+class ConstraintOnlyHead(UncertaintyHeadBase):
+    """Structure-only ablation with no access to frozen LLM activations."""
+
+    supports_constraint_inputs = True
+    emits_trace_logit = False
+
+    def __init__(self, feature_dim, num_classes=1, head_dim=256, dropout=0.1, **kwargs):
+        super().__init__(feature_dim, num_classes)
+        self.claim_net = nn.Sequential(
+            nn.Linear(CLAIM_CONSTRAINT_DIM + TRACE_CONSTRAINT_DIM, head_dim), nn.LayerNorm(head_dim), nn.GELU(),
+            nn.Dropout(dropout), nn.Linear(head_dim, num_classes),
+        )
+
+    def forward_claims(
+        self, features, attention_mask, claim_masks, claim_types=None,
+        claim_constraint_features=None, trace_constraint_features=None,
+    ):
+        if claim_constraint_features is None or trace_constraint_features is None:
+            raise ValueError("constraint_only requires native constraint cache fields")
+        results = []
+        for i, x in enumerate(claim_constraint_features):
+            x = x.to(features.device).float()
+            trace = trace_constraint_features[i].to(features.device).float().unsqueeze(0).expand(x.shape[0], -1)
+            results.append(self.claim_net(torch.cat([x, trace], dim=-1)))
+        return results

@@ -94,11 +94,17 @@ class ClaimUQModel(nn.Module):
         attention_mask: torch.Tensor,           # (B, L)
         claim_masks: Optional[List[torch.Tensor]] = None,
         claim_types: Optional[List[torch.Tensor]] = None,
+        claim_constraint_features: Optional[List[torch.Tensor]] = None,
+        trace_constraint_features: Optional[torch.Tensor] = None,
         claim_labels: Optional[List[torch.Tensor]] = None,   # list of (C_i,)
         trace_labels: Optional[torch.Tensor] = None,          # (B,)
         **kwargs,
     ) -> UQOutput:
-        out: HeadOutput = self.head(features, attention_mask, claim_masks, claim_types)
+        out: HeadOutput = self.head(
+            features, attention_mask, claim_masks, claim_types,
+            claim_constraint_features=claim_constraint_features,
+            trace_constraint_features=trace_constraint_features,
+        )
 
         claim_loss = None
         trace_loss = None

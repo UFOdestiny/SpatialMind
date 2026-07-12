@@ -47,7 +47,7 @@ eval_head() {
         --head_path "${RESULTS_ROOT}/train/${head_type}/final_model" \
         --cache_dir "${cache_dir}" --output_dir "${out_dir}" \
         --split test --batch_size "${TRAIN_BATCH_SIZE:-128}" \
-        --calibrate "${CALIBRATE:-auto}" --struct_calib_C "${STRUCT_CALIB_C:-0.01}" \
+        --calibrate "${CALIBRATE:-standard}" --struct_calib_C "${STRUCT_CALIB_C:-0.01}" \
         2>&1 | tee "${log}"
     return ${PIPESTATUS[0]}
 }
@@ -58,7 +58,7 @@ eval_baselines() {
     CUDA_VISIBLE_DEVICES="$(_eval_gpu)" "${PYTHON_BIN:-python}" scripts/evaluate.py \
         --cache_dir "${cache_dir}" --output_dir "${out_dir}" \
         --split test --eval_baselines --batch_size "${TRAIN_BATCH_SIZE:-128}" \
-        --calibrate "${CALIBRATE:-auto}" --struct_calib_C "${STRUCT_CALIB_C:-0.01}" \
+        --calibrate "${CALIBRATE:-standard}" --struct_calib_C "${STRUCT_CALIB_C:-0.01}" \
         2>&1 | tee "${LOGS_ROOT}/eval/eval_$(basename "${out_dir}")_baselines.log"
     return ${PIPESTATUS[0]}
 }
@@ -92,7 +92,7 @@ prepare_ood_cache() {
         "${PYTHON_BIN:-python}" scripts/generate.py \
             --dataset "${ood}" --split "${ood_splits}" \
             --max_samples "${GEN_MAX_OOD_VAL:-${GEN_MAX_OOD:-0}},${GEN_MAX_OOD:-0}" \
-            --max_new_tokens "${GEN_MAX_NEW_TOKENS:-256}" --backend "${BACKEND:-vllm}" \
+            --max_new_tokens "${GEN_MAX_NEW_TOKENS:-768}" --backend "${BACKEND:-vllm}" \
             --model_path "${MODEL_PATH}" --dataset_path "$(_ood_dataset_path "${ood}")" \
             --cache_dir "${ood_cache}" --batch_size "${GEN_BATCH_SIZE:-32}" \
             --free_form_batch_size "${FREE_FORM_GEN_BATCH_SIZE:-8}" --skip_existing \
@@ -106,7 +106,7 @@ prepare_ood_cache() {
         "${PYTHON_BIN:-python}" scripts/judge.py \
             --cache_dir "${ood_cache}" --split "${ood_splits}" \
             --judge_model "${JUDGE_MODEL_PATH}" --judge_backend "${BACKEND:-vllm}" \
-            --judge_max_new_tokens "${JUDGE_MAX_NEW_TOKENS:-256}" \
+            --judge_max_new_tokens "${JUDGE_MAX_NEW_TOKENS:-512}" \
             2>&1 | tee "${LOGS_ROOT}/data/judge_ood_${ood}.log"
     fi
 }
@@ -135,7 +135,8 @@ run_phase3() {
                 echo "  [FAILED] OOD cache missing for ${ood}"; fail=$((fail+1)); continue
             fi
             if ! cache_split_ready "${ood_cache}" "validation"; then
-                echo "  [WARN] OOD ${ood}: no validation split; calibration will fall back to test."
+                echo "  [FAILED] OOD ${ood}: strict protocol requires validation; no test fallback."
+                fail=$((fail+1)); continue
             fi
             for ht in "${ALL_HEAD_TYPES[@]}"; do
                 if is_ood_eval_complete "${ood}" "${ht}"; then echo "  [SKIP] OOD ${ood}/${ht}"; continue; fi

@@ -32,6 +32,7 @@ from data.cached_features import CachedFeatureDataset
 from models.heads import build_head
 from models.wrapper import ClaimUQModel
 from scripts.trainer import train_loop
+from spatial_constraints import CLAIM_CONSTRAINT_DIM, TRACE_CONSTRAINT_DIM
 from utils.efficiency import (
     get_cpu_peak_memory_gb,
     get_gpu_peak_memory_gb,
@@ -206,6 +207,11 @@ def main():
         "aggregation": state.best_aggregation,   # {method, mix_weights}
         "trainable_params": trainable,
         "cache_dir": cache_dir,
+        "cache_schema_version": int(train_ds.manifest.get("cache_schema_version", 0)),
+        "constraint_method": train_ds.manifest.get("constraint_method", ""),
+        "claim_constraint_dim": CLAIM_CONSTRAINT_DIM,
+        "trace_constraint_dim": TRACE_CONSTRAINT_DIM,
+        "seed": cfg.training.seed,
     }
     torch.save(model.head.state_dict(), os.path.join(final_dir, "head_weights.pth"))
     with open(os.path.join(final_dir, "head_config.json"), "w", encoding="utf-8") as f:

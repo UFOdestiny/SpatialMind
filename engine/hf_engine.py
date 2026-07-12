@@ -65,6 +65,8 @@ class HFGenerationEngine:
         feature_extractor: CombinedExtractor,
         max_new_tokens: int,
         use_attention: bool,
+        structured_json_schema=None,
+        structured_regex=None,
     ) -> GenerationResult:
         """Tokenize prompts, generate tokens, extract features.
 
@@ -78,6 +80,8 @@ class HFGenerationEngine:
             GenerationResult with generated texts, features, token probs,
             and log-likelihoods.
         """
+        if structured_json_schema is not None or structured_regex is not None:
+            raise RuntimeError("JSON-schema guided decoding requires the vLLM backend")
         cfg = self.cfg
 
         # Tokenize
@@ -122,7 +126,10 @@ class HFGenerationEngine:
             log_likelihoods=log_likelihoods,
         )
 
-    def generate_text_only(self, prompts: List[str], max_new_tokens: int) -> List[str]:
+    def generate_text_only(
+        self, prompts: List[str], max_new_tokens: int, structured_json_schema=None,
+        structured_regex=None,
+    ) -> List[str]:
         """Generate text without feature extraction (for judge.py).
 
         Args:
@@ -132,6 +139,8 @@ class HFGenerationEngine:
         Returns:
             List of generated text strings.
         """
+        if structured_json_schema is not None or structured_regex is not None:
+            raise RuntimeError("JSON-schema guided decoding requires the vLLM backend")
         cfg = self.cfg
 
         inputs = self.tokenizer(

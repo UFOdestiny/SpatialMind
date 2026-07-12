@@ -18,6 +18,7 @@ Estimators:
     perplexity    : mean negative log-likelihood (exp for perplexity scale)
     token_entropy : mean top-k predictive entropy
     ccp           : cumulative confidence penalty (mean -log top-1 prob)
+    constraint_rule: deterministic explicit satisfiability/entailment baseline
 """
 
 from __future__ import annotations
@@ -199,12 +200,43 @@ class TokenEntropyEstimator(UnsupervisedEstimator):
         return out
 
 
+class ConstraintRuleEstimator(UnsupervisedEstimator):
+    """Training-free score derived only from the explicit constraint engine."""
+
+    def __init__(self):
+        super().__init__("constraint_rule")
+
+    def estimate_claims(self, raw_sample: dict):
+        cf = self.to_numpy(raw_sample.get("claim_constraint_features"))
+        claims = raw_sample.get("claims") or []
+        if cf is None or cf.ndim != 2 or cf.shape[0] != len(claims):
+            return None
+        out = []
+        for x in cf:
+            parseable, feasible_with = float(x[0]), float(x[6])
+            entailed, contradicted, unknown = float(x[7]), float(x[8]), float(x[9])
+            repair = float(x[11])
+            if parseable < 0.5:
+                confidence = 0.5
+            elif contradicted > 0.5 or feasible_with < 0.5:
+                confidence = 0.08 + 0.12 * (1.0 - repair)
+            elif entailed > 0.5:
+                confidence = 0.92
+            elif unknown > 0.5:
+                confidence = 0.55
+            else:
+                confidence = 0.5
+            out.append(float(1.0 - np.clip(confidence, 0.0, 1.0)))
+        return out
+
+
 UNSUPERVISED_HEAD_REGISTRY = {
     "random": RandomBaseline,
     "mcp": MCPEstimator,
     "perplexity": PerplexityEstimator,
     "token_entropy": TokenEntropyEstimator,
     "ccp": CCPEstimator,
+    "constraint_rule": ConstraintRuleEstimator,
 }
 
 UNSUPERVISED_HEAD_ALIASES = {

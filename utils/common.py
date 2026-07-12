@@ -34,6 +34,8 @@ def collate_claim_traces(batch: List[dict]) -> dict:
         claim_masks     : list[(C_i, L)]     per-trace token-span masks
         claim_types     : list[(C_i,)]       per-trace claim-type ids
         claim_labels    : list[(C_i,)]       per-trace claim labels
+        claim_constraint_features : list[(C_i, D_c)] explicit per-claim constraints
+        trace_constraint_features : (B, D_t) explicit trace constraints
         trace_labels    : (B,)               sample-level labels
         k_hops          : (B,)
     """
@@ -50,6 +52,7 @@ def collate_claim_traces(batch: List[dict]) -> dict:
     claim_masks: List[torch.Tensor] = []
     claim_types: List[torch.Tensor] = []
     claim_labels: List[torch.Tensor] = []
+    claim_constraint_features: List[torch.Tensor] = []
 
     for item in batch:
         claims = item.get("claims", []) or []
@@ -80,9 +83,18 @@ def collate_claim_traces(batch: List[dict]) -> dict:
         claim_masks.append(torch.stack(masks))
         claim_types.append(torch.tensor(types, dtype=torch.long))
         claim_labels.append(torch.tensor(labs, dtype=torch.float32))
+        cf = torch.as_tensor(item["claim_constraint_features"], dtype=torch.float32)
+        if cf.shape[0] != len(labs):
+            raise ValueError(
+                f"claim constraint rows ({cf.shape[0]}) != usable claims ({len(labs)})"
+            )
+        claim_constraint_features.append(cf)
 
     trace_labels = torch.tensor([int(b.get("trace_label", 1)) for b in batch], dtype=torch.long)
     k_hops = torch.tensor([int(b.get("k_hop", 0)) for b in batch], dtype=torch.long)
+    trace_constraint_features = torch.stack([
+        torch.as_tensor(b["trace_constraint_features"], dtype=torch.float32) for b in batch
+    ])
 
     return {
         "features": features,
@@ -90,6 +102,8 @@ def collate_claim_traces(batch: List[dict]) -> dict:
         "claim_masks": claim_masks,
         "claim_types": claim_types,
         "claim_labels": claim_labels,
+        "claim_constraint_features": claim_constraint_features,
+        "trace_constraint_features": trace_constraint_features,
         "trace_labels": trace_labels,
         "k_hops": k_hops,
     }

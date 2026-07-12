@@ -51,6 +51,7 @@ import torch
 from config import Config, GLOBAL_SEED
 from data.claims import CLAIM_TYPE2ID, extract_claims_from_llm_output
 from engine import get_engine
+from spatial_constraints import analyze_trace
 
 logging.basicConfig(
     level=logging.INFO,
@@ -88,6 +89,30 @@ def _build_claim_extractor_prompt(question: str, generated_text: str) -> str:
         f"R: {generated_text}\n\n"
         "JSON:"
     )
+
+
+def _build_claim_extractor_schema() -> dict:
+    return {
+        "type": "object",
+        "properties": {
+            "claims": {
+                "type": "array",
+                "minItems": 3,
+                "maxItems": 6,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "type": {"type": "string", "enum": ["reasoning", "conclusion"]},
+                        "text": {"type": "string", "minLength": 1},
+                    },
+                    "required": ["type", "text"],
+                    "additionalProperties": False,
+                },
+            }
+        },
+        "required": ["claims"],
+        "additionalProperties": False,
+    }
 
 
 def parse_args():
@@ -179,6 +204,19 @@ def _update_claim_manifest(
     _write_manifest(manifest_path, manifest)
 
 
+def _refresh_manifest_sample_counts(manifest: dict, split_dir: Path, num_chunks: int):
+    """Make manifest counts reflect the samples physically present on disk."""
+    chunk_sample_counts = []
+    for chunk_idx in range(num_chunks):
+        chunk_path = split_dir / f"chunk_{chunk_idx}.pt"
+        if not chunk_path.exists():
+            chunk_sample_counts.append(0)
+            continue
+        chunk_sample_counts.append(len(load_chunk(chunk_path)))
+    manifest["chunk_sample_counts"] = chunk_sample_counts
+    manifest["total_count"] = sum(chunk_sample_counts)
+
+
 def needs_claim_extraction(sample: dict) -> bool:
     """Check if sample needs LLM-based claim extraction."""
     claims = sample.get("claims", [])
@@ -246,6 +284,7 @@ def process_split(
         log.info("Processing chunk %d/%d: %s", chunk_idx + 1, num_chunks, chunk_path)
         chunk_data = load_chunk(chunk_path)
         chunk_modified = False
+        drop_indices = set()
 
         # Collect samples needing extraction
         samples_to_process = []
@@ -293,7 +332,11 @@ def process_split(
 
             # Extract claims via LLM
             try:
-                outputs = engine.generate_text_only(prompts, max_new_tokens)
+                outputs = engine.generate_text_only(
+                    prompts,
+                    max_new_tokens,
+                    structured_json_schema=_build_claim_extractor_schema(),
+                )
             except Exception as e:
                 log.error("Claim extraction failed: %s", e)
                 chunk_had_batch_error = True
@@ -311,6 +354,11 @@ def process_split(
                     tokenizer=engine.tokenizer,
                     generated_token_ids=None,
                 )
+                if not claims:
+                    drop_indices.add(orig_idx)
+                    chunk_modified = True
+                    log.warning("  Dropping sample %d: claim extraction contract failed", orig_idx)
+                    continue
 
                 # Convert claims to dict format for storage (SpatialClaim -> dict)
                 claims_dict = []
@@ -344,9 +392,33 @@ def process_split(
                 # Update sample in chunk_data
                 chunk_data[orig_idx]["claims"] = claims_dict
                 chunk_data[orig_idx]["verified"] = [-1] * len(claims_dict)  # Pending verification (-1)
+                constraint_analysis = analyze_trace(
+                    context=str(sample.get("context", "")),
+                    question=str(sample.get("question", "")),
+                    claims=claims_dict,
+                )
+                chunk_data[orig_idx]["claim_constraint_features"] = torch.tensor(
+                    [x.features for x in constraint_analysis.claims], dtype=torch.float32
+                )
+                chunk_data[orig_idx]["trace_constraint_features"] = torch.tensor(
+                    constraint_analysis.trace_features, dtype=torch.float32
+                )
+                chunk_data[orig_idx]["constraint_analysis"] = constraint_analysis.to_dict()
                 total_processed += 1
                 total_claims += len(claims_dict)
                 chunk_modified = True
+
+        if drop_indices:
+            dropped_by_trace_label = Counter(
+                str(chunk_data[i].get("label", "invalid")) for i in drop_indices
+            )
+            chunk_data = [s for i, s in enumerate(chunk_data) if i not in drop_indices]
+            manifest["claim_extraction_dropped_samples"] = int(
+                manifest.get("claim_extraction_dropped_samples", 0)
+            ) + len(drop_indices)
+            cumulative = Counter(manifest.get("claim_extraction_dropped_by_trace_label", {}))
+            cumulative.update(dropped_by_trace_label)
+            manifest["claim_extraction_dropped_by_trace_label"] = dict(sorted(cumulative.items()))
 
         # Save modified chunk with statistics
         if chunk_modified:
@@ -414,6 +486,9 @@ def process_split(
             status="running",
         )
 
+    # Failed extraction contracts delete complete samples, so the cache index
+    # must be updated even when claim extraction is run without a later judge.
+    _refresh_manifest_sample_counts(manifest, split_dir, num_chunks)
     final_status = (
         "complete"
         if (missing_chunks == 0 and chunks_completed == num_chunks)

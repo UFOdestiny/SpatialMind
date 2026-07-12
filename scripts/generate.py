@@ -43,7 +43,9 @@ from utils.numpy_compat import (
 )
 from utils.chain_judge import (
     build_chain_stage1_prompt,
+    build_chain_stage1_schema,
     build_chain_stage2_prompt,
+    build_chain_stage2_schema,
     parse_chain_stage1_output,
     parse_chain_stage2_output,
 )
@@ -54,13 +56,21 @@ patch_numpy_core_multiarray()
 import torch
 
 from config import Config, GLOBAL_SEED
-from data.claims import CLAIM_TYPE2ID, PENDING_LABEL, extract_claims_from_generation, extract_claims_from_llm_output
+from data.claims import (
+    CLAIM_TYPE2ID,
+    PENDING_LABEL,
+    extract_claims_from_generation,
+    extract_claims_from_llm_output,
+    extract_claims_from_structured_generation,
+    parse_structured_generation_output,
+)
 from data.datasets import get_dataset
 from models.features.hidden_states import HiddenStateExtractor
 from models.features.token_probs import TokenProbExtractor
 from models.features.attention import AttentionExtractor
 from models.features.combined import CombinedExtractor
 from engine import get_engine
+from spatial_constraints import CLAIM_CONSTRAINT_DIM, TRACE_CONSTRAINT_DIM, analyze_trace
 
 logging.basicConfig(
     level=logging.INFO,
@@ -82,6 +92,93 @@ JUDGE_USER_TEMPLATE = (
     "Return: {{\"answer\":\"correct|incorrect\",\"verified\":[0|1,...]}}\n"
     "verified: 1=correct, 0=hallucinated. Length must match claims."
 )
+
+GUIDED_GENERATION_INSTRUCTION = (
+    "Return only a JSON object with this shape: "
+    '{"reasoning":["atomic spatial step", "..."],"conclusion":"final answer"}. '
+    "Include 1-6 short, non-empty reasoning steps and exactly one short, non-empty conclusion."
+)
+
+
+def _build_generation_schema() -> dict:
+    return {
+        "type": "object",
+        "properties": {
+            "reasoning": {
+                "type": "array",
+                "items": {"type": "string", "minLength": 1, "maxLength": 96},
+                "minItems": 1,
+                "maxItems": 6,
+            },
+            "conclusion": {"type": "string", "minLength": 1, "maxLength": 64},
+        },
+        "required": ["reasoning", "conclusion"],
+        "additionalProperties": False,
+    }
+
+
+def _build_generation_regex() -> str:
+    """Bounded compact JSON contract enforced directly by vLLM's regex FSM."""
+    atom = r'[^"\\\r\n]{1,96}'
+    conclusion = r'[^"\\\r\n]{1,64}'
+    return (
+        r'\{"reasoning":\["' + atom + r'"(?:,"' + atom
+        + r'"){0,5}\],"conclusion":"' + conclusion + r'"\}'
+    )
+
+
+def _build_claim_extractor_schema() -> dict:
+    return {
+        "type": "object",
+        "properties": {
+            "claims": {
+                "type": "array",
+                "minItems": 3,
+                "maxItems": 6,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "type": {"type": "string", "enum": ["reasoning", "conclusion"]},
+                        "text": {"type": "string", "minLength": 1},
+                    },
+                    "required": ["type", "text"],
+                    "additionalProperties": False,
+                },
+            }
+        },
+        "required": ["claims"],
+        "additionalProperties": False,
+    }
+
+
+def _add_guided_generation_instruction(messages):
+    copied = [dict(m) for m in messages]
+    for idx in range(len(copied) - 1, -1, -1):
+        if copied[idx].get("role") == "user":
+            copied[idx]["content"] = (
+                str(copied[idx].get("content", "")).rstrip()
+                + "\n\n"
+                + GUIDED_GENERATION_INSTRUCTION
+            )
+            return copied
+    return copied + [{"role": "user", "content": GUIDED_GENERATION_INSTRUCTION}]
+
+
+def _generate_guided_stage2(engine, prompts, reasoning_positions, max_new_tokens):
+    """Guided-decode variable-length Stage-2 batches, grouped by array length."""
+    outputs = [None] * len(prompts)
+    by_count = defaultdict(list)
+    for idx, positions in enumerate(reasoning_positions):
+        by_count[len(positions)].append(idx)
+    for count, idxs in by_count.items():
+        group = engine.generate_text_only(
+            [prompts[i] for i in idxs],
+            max_new_tokens,
+            structured_json_schema=build_chain_stage2_schema(count),
+        )
+        for local_idx, output_idx in enumerate(idxs):
+            outputs[output_idx] = group[local_idx]
+    return outputs
 
 
 def set_seed(seed: int):
@@ -301,12 +398,12 @@ def _enforce_claim_label_consistency(
     sample_label: int,
 ):
     """
-    Enforce robust sample/claim label consistency.
+    Apply the independently measured answer label to the conclusion claim.
 
     Label convention: 1=correct/non-hallucinated, 0=incorrect/hallucinated.
     
-    - Conclusion claims are forced to align with sample label.
-    - If no conclusion exists and sample is hallucinated (0), at least one claim is set to 0.
+    The claim structure is validated elsewhere; this function never invents a
+    missing claim or changes a reasoning-claim label.
     """
     if not isinstance(claim_dicts, list) or not isinstance(verified, list):
         return verified
@@ -324,13 +421,6 @@ def _enforce_claim_label_consistency(
     for i in conclusion_idx:
         verified[i] = target
 
-    # Ensure there is at least one hallucinated claim for hallucinated samples (target=0).
-    if target == 0 and all(int(v) != 0 for v in verified):
-        if conclusion_idx:
-            verified[conclusion_idx[-1]] = 0
-        else:
-            verified[-1] = 0
-
     return verified
 
 
@@ -338,75 +428,33 @@ def _ensure_reasoning_conclusion_contract(
     claim_dicts,
     verified,
     sample_label: int,
-    fallback_conclusion_text: str = "",
 ):
-    """Guarantee at least one conclusion claim and sane labels for reasoning/conclusion only.
+    """Validate a reasoning/conclusion sequence without repairing it.
     
     Label convention: 1=correct/non-hallucinated, 0=incorrect/hallucinated.
     """
-    if not isinstance(claim_dicts, list):
-        claim_dicts = []
-    if not isinstance(verified, list):
-        verified = []
-
-    # Keep only reasoning/conclusion claims.
-    filtered_claims = []
-    filtered_verified = []
-    for i, c in enumerate(claim_dicts):
-        if not isinstance(c, dict):
-            continue
-        ctype = str(c.get("claim_type", "")).strip().lower()
-        if ctype not in {"reasoning", "conclusion"}:
-            continue
-        c = dict(c)
-        c["claim_type"] = ctype
-        c["claim_type_id"] = CLAIM_TYPE2ID.get(ctype, 2)
-        filtered_claims.append(c)
-        # Preserve labels including the pending sentinel (-1): reasoning claims are
-        # unlabeled until the Stage-2 judge runs. Only 0/1 are final labels; anything
-        # else (missing / unparseable) becomes pending so the judge will label it.
-        v = verified[i] if i < len(verified) else PENDING_LABEL
-        try:
-            iv = int(v)
-        except Exception:
-            iv = PENDING_LABEL
-        filtered_verified.append(iv if iv in (0, 1) else PENDING_LABEL)
-
-    claim_dicts = filtered_claims
-    verified = filtered_verified
-
-    # Ensure exactly one conclusion at the end.
-    conclusion_indices = [
-        i for i, c in enumerate(claim_dicts)
-        if str(c.get("claim_type", "")).strip().lower() == "conclusion"
-    ]
-    if conclusion_indices:
-        keep = conclusion_indices[-1]
-        new_claims = []
-        new_verified = []
-        for i, c in enumerate(claim_dicts):
-            ctype = str(c.get("claim_type", "")).strip().lower()
-            if ctype == "conclusion" and i != keep:
-                continue
-            new_claims.append(c)
-            new_verified.append(verified[i])
-        claim_dicts, verified = new_claims, new_verified
-    else:
-        # Synthesize one conclusion when missing.
-        fallback_text = (fallback_conclusion_text or "").strip() or "unknown"
-        claim_dicts.append(
-            {
-                "text": fallback_text,
-                "claim_type": "conclusion",
-                "claim_type_id": CLAIM_TYPE2ID["conclusion"],
-                "aligned_token_ids": [0],
-            }
-        )
-        # sample_label: 1=correct, 0=hallucinated
-        if int(sample_label) in (0, 1):
-            verified.append(int(sample_label))
-        else:
-            verified.append(1)  # Default to correct if unknown
+    if not isinstance(claim_dicts, list) or not isinstance(verified, list):
+        return [], []
+    if len(claim_dicts) < 2 or len(verified) != len(claim_dicts):
+        return [], []
+    if any(not isinstance(c, dict) for c in claim_dicts):
+        return [], []
+    claim_types = [str(c.get("claim_type", "")).strip().lower() for c in claim_dicts]
+    if any(t not in {"reasoning", "conclusion"} for t in claim_types):
+        return [], []
+    if claim_types[-1] != "conclusion" or claim_types.count("conclusion") != 1:
+        return [], []
+    if not any(t == "reasoning" for t in claim_types[:-1]):
+        return [], []
+    if any(not str(c.get("text", "")).strip() for c in claim_dicts):
+        return [], []
+    try:
+        normalized_verified = [int(v) for v in verified]
+    except Exception:
+        return [], []
+    if any(v not in (PENDING_LABEL, 0, 1) for v in normalized_verified):
+        return [], []
+    verified = normalized_verified
 
     # Force conclusion label to sample label where available.
     if int(sample_label) in (0, 1):
@@ -440,6 +488,8 @@ def generate_split(
     chunk_size = args.chunk_size or cfg.generation.chunk_size
     skip_existing = args.skip_existing and cfg.generation.skip_existing
     backend = args.backend or cfg.generation.backend
+    generation_schema = _build_generation_schema() if backend == "vllm" else None
+    generation_regex = _build_generation_regex() if backend == "vllm" else None
     model_path = args.model_path or cfg.model.pretrained_model_name_or_path
     claim_extractor_engine = getattr(args, "_claim_extractor_engine", None)
     claim_extractor_max_new_tokens = int(getattr(args, "claim_extractor_max_new_tokens", 1025) or 1025)
@@ -521,6 +571,9 @@ def generate_split(
     claim_labeler_supervised_overrides = 0
     inline_judge_processed = 0
     inline_judge_unparseable = 0
+    total_dropped = 0
+    dropped_reasons = Counter()
+    dropped_by_trace_label = Counter()
     counted_existing_chunks = set()
     total_samples = len(ds)
     last_progress_log = 0
@@ -563,19 +616,25 @@ def generate_split(
         gt_strings = []
         batch_k_hops = []
         batch_questions = []
+        batch_contexts = []
 
         for raw_item in raw_items:
             messages = ds.build_chat_messages(raw_item)
+            if generation_schema is not None:
+                messages = _add_guided_generation_instruction(messages)
             try:
                 text = engine.tokenizer.apply_chat_template(
                     messages, tokenize=False, add_generation_prompt=True
                 )
             except Exception:
                 text = ds.build_prompt(raw_item)
+                if generation_schema is not None:
+                    text = text.rstrip() + "\n\n" + GUIDED_GENERATION_INSTRUCTION
             prompts.append(text)
             gt_strings.append(ds.get_ground_truth(raw_item))
             batch_k_hops.append(ds.get_difficulty(raw_item))
             batch_questions.append(ds.get_question(raw_item))
+            batch_contexts.append(ds.get_context(raw_item))
 
         # Generate + extract features via engine
         result = engine.generate_batch(
@@ -583,9 +642,11 @@ def generate_split(
             feature_extractor=feature_extractor,
             max_new_tokens=max_new_tokens,
             use_attention=use_attention,
+            structured_regex=generation_regex,
         )
 
         claim_extractor_outputs = None
+        claim_extractor_batch_failed = False
         if claim_extractor_engine is not None:
             claim_prompts = []
             for q, g in zip(batch_questions, result.generated_texts):
@@ -597,11 +658,15 @@ def generate_split(
                 claim_extractor_outputs = claim_extractor_engine.generate_text_only(
                     claim_prompts,
                     claim_extractor_max_new_tokens,
+                    structured_json_schema=_build_claim_extractor_schema(),
                 )
             except Exception as e:
-                log.warning("Claim extractor failed for batch %d-%d (%s); fallback to regex extraction.",
-                            start_idx, end_idx, str(e))
-                claim_extractor_outputs = None
+                log.warning(
+                    "Claim extractor failed for batch %d-%d (%s); dropping the affected samples.",
+                    start_idx, end_idx, str(e),
+                )
+                claim_extractor_outputs = []
+                claim_extractor_batch_failed = True
 
         # Process each sample in batch (pass 1: extract claims)
         per_sample_rows = []
@@ -622,27 +687,53 @@ def generate_split(
             if gen_len <= 0 and result.features is not None:
                 gen_len = int(result.features.shape[1])
 
-            predicted_answer = ds.parse_answer(gen_text)
+            structured_generation = (
+                parse_structured_generation_output(gen_text)
+                if generation_schema is not None
+                else None
+            )
+            predicted_answer = ds.parse_answer(
+                structured_generation[1] if structured_generation is not None else gen_text
+            )
             gt_answer = gt_strings[bi]
             label = ds.check_correctness(predicted_answer, gt_answer)
             answer_correct = (label == 1)
-            if claim_extractor_outputs is not None and bi < len(claim_extractor_outputs):
-                claims = extract_claims_from_llm_output(
-                    llm_output=claim_extractor_outputs[bi],
-                    generated_text=gen_text,
-                    answer_correct=answer_correct,
-                    tokenizer=engine.tokenizer,
-                    generated_token_ids=gen_token_ids if gen_token_ids else None,
-                )
+            claim_failure_reason = None
+            if claim_extractor_engine is not None:
+                if claim_extractor_batch_failed or bi >= len(claim_extractor_outputs or []):
+                    claims = []
+                else:
+                    claims = extract_claims_from_llm_output(
+                        llm_output=claim_extractor_outputs[bi],
+                        generated_text=gen_text,
+                        answer_correct=answer_correct,
+                        tokenizer=engine.tokenizer,
+                        generated_token_ids=gen_token_ids if gen_token_ids else None,
+                    )
                 extraction_method = "llm"
             else:
-                claims = extract_claims_from_generation(
-                    generated_text=gen_text,
-                    answer_correct=answer_correct,
-                    tokenizer=engine.tokenizer,
-                    generated_token_ids=gen_token_ids if gen_token_ids else None,
-                )
-                extraction_method = "regex"
+                if generation_schema is not None:
+                    claims = extract_claims_from_structured_generation(
+                        generated_text=gen_text,
+                        answer_correct=answer_correct,
+                        tokenizer=engine.tokenizer,
+                        generated_token_ids=gen_token_ids if gen_token_ids else None,
+                    )
+                    extraction_method = "guided_json"
+                    if not claims:
+                        claim_failure_reason = (
+                            "generation_schema_failure"
+                            if structured_generation is None
+                            else "claim_token_alignment_failure"
+                        )
+                else:
+                    claims = extract_claims_from_generation(
+                        generated_text=gen_text,
+                        answer_correct=answer_correct,
+                        tokenizer=engine.tokenizer,
+                        generated_token_ids=gen_token_ids if gen_token_ids else None,
+                    )
+                    extraction_method = "regex"
             claim_dicts = [
                 {
                     "text": c.text,
@@ -664,20 +755,13 @@ def generate_split(
                     "answer_correct": answer_correct,
                     "k_hop": batch_k_hops[bi],
                     "question": batch_questions[bi],
-                    "features": (
-                        result.features[bi].cpu()
-                        if result.features is not None
-                        else torch.zeros(1, feature_dim, dtype=torch.bfloat16)
-                    ),
-                    "token_probs": (
-                        result.top_probs[bi].cpu()
-                        if result.top_probs is not None
-                        else torch.zeros(1, 4, dtype=torch.bfloat16)
-                    ),
+                    "context": batch_contexts[bi],
+                    "claim_failure_reason": claim_failure_reason,
+                    "sample_index": start_idx + bi,
+                    "features": result.features[bi].cpu() if result.features is not None else None,
+                    "token_probs": result.top_probs[bi].cpu() if result.top_probs is not None else None,
                     "log_likelihoods": (
-                        result.log_likelihoods[bi].cpu()
-                        if result.log_likelihoods is not None
-                        else torch.zeros(1, dtype=torch.bfloat16)
+                        result.log_likelihoods[bi].cpu() if result.log_likelihoods is not None else None
                     ),
                 }
             )
@@ -717,6 +801,7 @@ def generate_split(
                     stage1_outputs = claim_extractor_engine.generate_text_only(
                         stage1_prompts,
                         claim_labeler_max_new_tokens,
+                        structured_json_schema=build_chain_stage1_schema(),
                     )
                     for out_text, bi in zip(stage1_outputs, stage1_indices):
                         st1 = parse_chain_stage1_output(out_text)
@@ -761,26 +846,24 @@ def generate_split(
                     build_chain_stage2_prompt(
                         tokenizer=claim_extractor_engine.tokenizer,
                         question=per_sample_rows[bi]["question"],
-                        generated_text=per_sample_rows[bi]["gen_text"],
+                        context=per_sample_rows[bi]["context"],
                         reasoning_claims=reasoning_texts,
-                        conclusion_claim=conclusion_text,
-                        answer_label=stage1_answer_labels.get(bi, per_sample_rows[bi]["label"]),
                     )
                 )
                 stage2_indices.append(bi)
             if stage2_prompts:
                 try:
-                    stage2_outputs = claim_extractor_engine.generate_text_only(
+                    stage2_outputs = _generate_guided_stage2(
+                        claim_extractor_engine,
                         stage2_prompts,
+                        [stage2_reasoning_pos[bi] for bi in stage2_indices],
                         claim_labeler_max_new_tokens,
                     )
                     for out_text, bi in zip(stage2_outputs, stage2_indices):
                         reasoning_pos = stage2_reasoning_pos.get(bi, [])
-                        answer_label = stage1_answer_labels.get(bi, per_sample_rows[bi]["label"])
                         parsed_reasoning, _ = parse_chain_stage2_output(
                             out_text,
                             expected_len=len(reasoning_pos),
-                            answer_label=answer_label,
                         )
                         if parsed_reasoning is None:
                             continue
@@ -828,6 +911,7 @@ def generate_split(
                     stage1_outputs = claim_extractor_engine.generate_text_only(
                         judge_prompts,
                         judge_max_new_tokens,
+                        structured_json_schema=build_chain_stage1_schema(),
                     )
                     inline_judge_processed += len(judge_indices)
 
@@ -872,27 +956,25 @@ def generate_split(
                                 build_chain_stage2_prompt(
                                     tokenizer=claim_extractor_engine.tokenizer,
                                     question=per_sample_rows[bi]["question"],
-                                    generated_text=per_sample_rows[bi]["gen_text"],
+                                    context=per_sample_rows[bi]["context"],
                                     reasoning_claims=reasoning_texts,
-                                    conclusion_claim=conclusion_text,
-                                    answer_label=stage1_answer_labels.get(bi),
                                 )
                             )
                             stage2_indices.append(bi)
                             stage2_reasoning_pos[bi] = reasoning_pos
 
                     if stage2_prompts:
-                        stage2_outputs = claim_extractor_engine.generate_text_only(
+                        stage2_outputs = _generate_guided_stage2(
+                            claim_extractor_engine,
                             stage2_prompts,
+                            [stage2_reasoning_pos[bi] for bi in stage2_indices],
                             judge_max_new_tokens,
                         )
                         for out_text, bi in zip(stage2_outputs, stage2_indices):
                             reasoning_pos = stage2_reasoning_pos.get(bi, [])
-                            answer_label = stage1_answer_labels.get(bi)
                             parsed_reasoning, _ = parse_chain_stage2_output(
                                 out_text,
                                 expected_len=len(reasoning_pos),
-                                answer_label=answer_label,
                             )
                             if parsed_reasoning is None:
                                 continue
@@ -912,12 +994,51 @@ def generate_split(
             claim_dicts = per_sample_claims[bi]
             verified = per_sample_verified[bi]
 
+            if (
+                not str(row.get("gen_text", "")).strip()
+                or int(row.get("gen_len", 0)) <= 0
+                or row.get("features") is None
+                or row.get("token_probs") is None
+                or row.get("log_likelihoods") is None
+            ):
+                total_dropped += 1
+                dropped_reasons["incomplete_generation_artifacts"] += 1
+                dropped_by_trace_label[str(row.get("label", "invalid"))] += 1
+                log.warning(
+                    "Dropping sample %s: incomplete generation artifacts",
+                    row.get("sample_index"),
+                )
+                continue
+
             claim_dicts, verified = _ensure_reasoning_conclusion_contract(
                 claim_dicts,
                 verified,
                 sample_label=row["label"],
-                fallback_conclusion_text=row.get("predicted_answer", "") or row.get("gen_text", ""),
             )
+            if not claim_dicts:
+                total_dropped += 1
+                reason = row.get("claim_failure_reason") or "claim_contract_failure"
+                dropped_reasons[reason] += 1
+                dropped_by_trace_label[str(row.get("label", "invalid"))] += 1
+                log.warning(
+                    "Dropping sample %s: %s", row.get("sample_index"), reason
+                )
+                continue
+            labels_must_be_complete = claim_extractor_engine is not None and (
+                not ds.needs_judge or inline_judge_enabled
+            )
+            if labels_must_be_complete and (
+                int(row.get("label", -1)) not in (0, 1)
+                or any(int(v) not in (0, 1) for v in verified)
+            ):
+                total_dropped += 1
+                dropped_reasons["inline_labeling_failure"] += 1
+                dropped_by_trace_label[str(row.get("label", "invalid"))] += 1
+                log.warning(
+                    "Dropping sample %s: incomplete inline labels",
+                    row.get("sample_index"),
+                )
+                continue
             per_sample_claims[bi] = claim_dicts
             per_sample_verified[bi] = verified
 
@@ -940,6 +1061,12 @@ def generate_split(
                 eff_len = max(1, min(int(row["gen_len"]), int(result.features.shape[1])))
                 attn_mask[:eff_len] = 1
 
+            constraint_analysis = analyze_trace(
+                context=row["context"],
+                question=row["question"],
+                claims=claim_dicts,
+            )
+
             sample_dict = {
                 "features": row["features"],
                 "attention_mask": attn_mask,
@@ -949,10 +1076,19 @@ def generate_split(
                 "predicted_answer": row["predicted_answer"],
                 "ground_truth": row["ground_truth"],
                 "question": row["question"],
+                "context": row["context"],
+                "sample_index": row["sample_index"],
                 "generated_text": row["gen_text"],
                 "dataset_name": dataset_name,
                 "claims": claim_dicts,
                 "verified": verified,
+                "claim_constraint_features": torch.tensor(
+                    [x.features for x in constraint_analysis.claims], dtype=torch.float32
+                ),
+                "trace_constraint_features": torch.tensor(
+                    constraint_analysis.trace_features, dtype=torch.float32
+                ),
+                "constraint_analysis": constraint_analysis.to_dict(),
                 "token_probs": row["token_probs"],
                 "log_likelihoods": row["log_likelihoods"],
             }
@@ -1069,6 +1205,8 @@ def generate_split(
     # labeled by the Stage-2 judge, so total_claim_pending drives judge scheduling.
     chunk_sample_counts = []
     total_claim_pending = 0
+    constraint_claims = constraint_parseable = constraint_contradicted = 0
+    constraint_entailed = constraint_first_conflicts = constraint_context_samples = 0
     for ci in range(chunk_idx):
         cp = split_dir / f"chunk_{ci}.pt"
         if cp.exists():
@@ -1079,6 +1217,15 @@ def generate_split(
                     total_claim_pending += sum(
                         1 for v in s.get("verified", []) if int(v) == -1
                     )
+                    ca = s.get("constraint_analysis", {}) or {}
+                    context_relations = ca.get("context_relations", []) or []
+                    constraint_context_samples += int(bool(context_relations))
+                    for claim_result in ca.get("claims", []) or []:
+                        constraint_claims += 1
+                        constraint_parseable += int(bool(claim_result.get("parsed")))
+                        constraint_contradicted += int(claim_result.get("status") == "contradicted")
+                        constraint_entailed += int(claim_result.get("status") == "entailed")
+                        constraint_first_conflicts += int(bool(claim_result.get("first_conflict")))
             except Exception:
                 chunk_sample_counts.append(-1)  # Invalid chunk
         else:
@@ -1088,6 +1235,18 @@ def generate_split(
         "split": split,
         "dataset_name": dataset_name,
         "granularity": "claim",
+        "cache_schema_version": 2,
+        "constraint_method": "explicit_spatial_relation_algebra_v1",
+        "claim_constraint_dim": CLAIM_CONSTRAINT_DIM,
+        "trace_constraint_dim": TRACE_CONSTRAINT_DIM,
+        "constraint_diagnostics": {
+            "claims": constraint_claims,
+            "parse_rate": constraint_parseable / max(constraint_claims, 1),
+            "contradiction_rate": constraint_contradicted / max(constraint_parseable, 1),
+            "entailment_rate": constraint_entailed / max(constraint_parseable, 1),
+            "first_conflict_rate": constraint_first_conflicts / max(total_processed, 1),
+            "context_coverage": constraint_context_samples / max(total_processed, 1),
+        },
         "total_count": total_processed,
         "chunk_size": chunk_size,
         "num_chunks": chunk_idx,
@@ -1106,6 +1265,11 @@ def generate_split(
         "hidden_size": hidden_size,
         "max_new_tokens": max_new_tokens_val,
         "backend": backend,
+        "generation_guided_decoding": bool(generation_schema is not None),
+        "generation_output_contract": (
+            "bounded_reasoning_array_plus_conclusion_regex_v2"
+            if generation_schema is not None else "legacy_text"
+        ),
         "correct_rate": correct_rate,
         "incorrect_rate": incorrect_rate,
         "total_correct": total_correct,
@@ -1131,6 +1295,9 @@ def generate_split(
             if (ds.needs_judge and inline_judge_enabled and claim_extractor_engine is not None)
             else ""
         ),
+        "generation_dropped_samples": int(total_dropped),
+        "generation_drop_reasons": dict(sorted(dropped_reasons.items())),
+        "generation_dropped_by_trace_label": dict(sorted(dropped_by_trace_label.items())),
     }
     manifest_path = split_dir / "manifest.json"
     with open(manifest_path, "w") as f:

@@ -82,6 +82,8 @@ def collect_predictions(model, loader: DataLoader, device: torch.device, amp_dty
                 attention_mask=batch["attention_mask"],
                 claim_masks=batch["claim_masks"],
                 claim_types=batch["claim_types"],
+                claim_constraint_features=batch["claim_constraint_features"],
+                trace_constraint_features=batch["trace_constraint_features"],
             )
         claim_logits = out.claim_logits.float()           # (B, max_claims, C)
         probs = torch.sigmoid(claim_logits.squeeze(-1))   # (B, max_claims)
@@ -211,6 +213,8 @@ def train_loop(
                     attention_mask=batch["attention_mask"],
                     claim_masks=batch["claim_masks"],
                     claim_types=batch["claim_types"],
+                    claim_constraint_features=batch["claim_constraint_features"],
+                    trace_constraint_features=batch["trace_constraint_features"],
                     claim_labels=batch["claim_labels"],
                     trace_labels=batch["trace_labels"],
                 )

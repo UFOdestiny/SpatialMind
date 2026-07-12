@@ -6,11 +6,10 @@ Stage 1:
 Stage 2:
   - reasoning-claim verification by chain consistency (not strict lexical GT match).
 
-Key improvements in this version:
-  - Robust parsing with multiple fallback strategies
-  - Flexible length handling (pad/truncate arrays)
-  - Per-claim fallback when array parsing fails
-  - Debug logging for parse failures
+Both stages are deliberately fail-closed. Stage 1 accepts only the exact JSON
+contract. Stage 2 must contain exactly one integer 0/1 label per reasoning
+claim. No embedded-JSON extraction, padding, truncation, coercion, or
+answer-derived fallback is permitted; the caller drops a failed sample.
 """
 
 from __future__ import annotations
@@ -48,10 +47,11 @@ CHAIN_STAGE2_SYSTEM_PROMPT = (
 # verdict is never shown).
 CHAIN_STAGE2_USER_TEMPLATE = (
     "Verify each spatial reasoning step below. A step is CORRECT (1) only if it is "
-    "a valid spatial inference given the question and the earlier steps; it is "
+    "a valid spatial inference given the trusted scene, question, and earlier steps; it is "
     "INCORRECT (0) if the direction/turn/relative position is wrong, unsupported, "
     "or contradicts the question. Judge each step on its own spatial merit — do NOT "
     "assume steps are correct, and do NOT use the final answer.\n\n"
+    "Trusted scene/premises: {context}\n"
     "Question: {question}\n\n"
     "Steps:\n{reasoning_claims_numbered}\n\n"
     "First, in \"analysis\", briefly check each step's spatial logic (e.g. 'a right "
@@ -214,28 +214,35 @@ def build_chain_stage1_prompt(
 
 
 def parse_chain_stage1_output(response: str) -> Dict[str, Optional[int]]:
-    """Parse stage 1 output. Labels: 1=correct, 0=incorrect."""
-    obj = _extract_json_obj(response)
+    """Parse only the exact Stage-1 JSON contract."""
+    try:
+        obj = json.loads((response or "").strip())
+    except Exception:
+        obj = None
     answer_label = None
     conclusion_verified = None
-    if isinstance(obj, dict):
-        ans = str(obj.get("answer", "")).strip().lower()
-        if ans == "correct":
-            answer_label = 1
-        elif ans == "incorrect":
-            answer_label = 0
-        conclusion_verified = _to_binary_label(obj.get("conclusion_verified"))
-    if answer_label is None:
-        lower = (response or "").strip().lower()
-        if "incorrect" in lower:
-            answer_label = 0
-        elif "correct" in lower:
-            answer_label = 1
-    if conclusion_verified is None and answer_label in (0, 1):
-        conclusion_verified = answer_label
+    if isinstance(obj, dict) and set(obj) == {"answer", "conclusion_verified"}:
+        ans = obj.get("answer")
+        conclusion = obj.get("conclusion_verified")
+        if ans in ("correct", "incorrect") and type(conclusion) is int and conclusion in (0, 1):
+            answer_label = 1 if ans == "correct" else 0
+            conclusion_verified = conclusion
     return {
         "answer_label": answer_label,
         "conclusion_verified": conclusion_verified,
+    }
+
+
+def build_chain_stage1_schema() -> dict:
+    """Exact JSON schema for answer/conclusion guided decoding."""
+    return {
+        "type": "object",
+        "properties": {
+            "answer": {"type": "string", "enum": ["correct", "incorrect"]},
+            "conclusion_verified": {"type": "integer", "enum": [0, 1]},
+        },
+        "required": ["answer", "conclusion_verified"],
+        "additionalProperties": False,
     }
 
 
@@ -249,7 +256,7 @@ def build_chain_stage2_schema(expected_len: int) -> dict:
     return {
         "type": "object",
         "properties": {
-            "analysis": {"type": "string"},
+            "analysis": {"type": "string", "maxLength": 800},
             "reasoning_verified": {
                 "type": "array",
                 "items": {"type": "integer", "enum": [0, 1]},
@@ -265,17 +272,9 @@ def build_chain_stage2_schema(expected_len: int) -> dict:
 def build_chain_stage2_prompt(
     tokenizer,
     question: str,
-    generated_text: str,
+    context: str,
     reasoning_claims: List[str],
-    conclusion_claim: str,
-    answer_label: Optional[int],
 ) -> str:
-    answer_verdict = "unknown"
-    if answer_label == 1:
-        answer_verdict = "CORRECT"
-    elif answer_label == 0:
-        answer_verdict = "INCORRECT"
-
     num_claims = len(reasoning_claims)
 
     # Build numbered list of claims (easier for LLM to match output length)
@@ -290,10 +289,8 @@ def build_chain_stage2_prompt(
         example_output = ""
 
     user_msg = CHAIN_STAGE2_USER_TEMPLATE.format(
+        context=context,
         question=question,
-        generated_text=generated_text,
-        answer_verdict=answer_verdict,
-        conclusion_claim=conclusion_claim,
         reasoning_claims_numbered=reasoning_claims_numbered,
         num_claims=num_claims,
         example_output=example_output,
@@ -310,141 +307,29 @@ def build_chain_stage2_prompt(
         return f"{CHAIN_STAGE2_SYSTEM_PROMPT}\n\n{user_msg}\n\nJSON:"
 
 
-def _infer_default_from_answer_label(answer_label: Optional[int]) -> int:
-    """Infer default reasoning label from answer verdict.
-
-    Heuristic: if answer is correct, reasoning steps are likely correct too.
-    If answer is incorrect, we're more conservative and mark as needing review.
-    """
-    if answer_label == 1:
-        return 1  # Correct answer → assume reasoning is correct
-    elif answer_label == 0:
-        return 0  # Incorrect answer → mark reasoning as potentially incorrect
-    return -1  # Unknown → keep as pending
-
-
 def parse_chain_stage2_output(
     response: str,
     expected_len: int,
-    answer_label: Optional[int] = None,
     log_failures: bool = False,
 ) -> Tuple[Optional[List[int]], str]:
-    """Parse stage 2 output with robust fallbacks.
-
-    Priority:
-    1. JSON object with reasoning_verified array (exact length match preferred)
-    2. Index-based extraction: [0]=1, [1]=0, etc.
-    3. Direct array extraction from text
-    4. Sequential binary pattern matching
-    5. Inference from answer_label (last resort)
-
-    Returns:
-        Tuple of (parsed_list, parse_status)
-        - parsed_list: List of labels (0/1) or None if completely failed
-        - parse_status: One of "exact", "indexed", "padded", "truncated", "fallback", "inferred", "failed"
-    """
+    """Strictly parse the guided JSON; any defect drops the entire sample."""
     if expected_len <= 0:
         return [], "exact"
-
-    default_label = _infer_default_from_answer_label(answer_label)
-    response_preview = (response or "")[:200]
-
-    # Strategy 1: Extract from JSON object
-    obj = _extract_json_obj(response)
-    vals = None
-    if isinstance(obj, dict):
-        vals = obj.get("reasoning_verified")
-        if vals is None:
-            # Try alternative keys
-            for key in ("verified", "labels", "results", "reasoning", "claims"):
-                if key in obj and isinstance(obj[key], list):
-                    vals = obj[key]
-                    break
-
-    # If JSON array found with exact length, use it directly
-    if isinstance(vals, list) and len(vals) == expected_len:
-        out = []
-        for v in vals:
-            b = _to_binary_label(v)
-            if b is None:
-                b = default_label if default_label in (0, 1) else 1
-            out.append(int(b))
-        return out, "exact"
-
-    # Strategy 2: Index-based extraction (e.g., "[0]: 1", "0: 1", "[0]=1")
-    indexed_result = _extract_indexed_values(response, expected_len)
-    if indexed_result is not None:
-        missing_count = sum(1 for v in indexed_result if v == -1)
-        if missing_count == 0:
-            return indexed_result, "indexed"
-        elif missing_count < expected_len // 2:
-            # Fill missing with default
-            for i in range(len(indexed_result)):
-                if indexed_result[i] == -1:
-                    indexed_result[i] = default_label if default_label in (0, 1) else 1
-            return indexed_result, "indexed"
-
-    # Strategy 3: Direct array extraction from text
-    if vals is None or not isinstance(vals, list):
-        vals = _extract_array_from_text(response)
-
-    # Strategy 4: Count binary indicators in response (sequential matching)
-    if vals is None or not isinstance(vals, list):
-        binary_matches = re.findall(r"(?:supported|correct|true|1)\b", response.lower())
-        neg_matches = re.findall(r"(?:unsupported|incorrect|false|hallucinated|0)\b", response.lower())
-        if len(binary_matches) + len(neg_matches) >= expected_len:
-            all_matches = []
-            for m in re.finditer(r"(supported|correct|true|unsupported|incorrect|false|hallucinated|\b[01]\b)", response.lower()):
-                val_str = m.group(1)
-                if val_str in ("supported", "correct", "true", "1"):
-                    all_matches.append(1)
-                else:
-                    all_matches.append(0)
-            if all_matches:
-                vals = all_matches
-
-    # Strategy 5: Inference fallback
-    if vals is None or not isinstance(vals, list):
-        if default_label in (0, 1):
-            if log_failures:
-                log.debug("Stage-2 parse failed, inferring from answer_label=%s: %s", answer_label, response_preview)
-            return [default_label] * expected_len, "inferred"
+    try:
+        obj = json.loads((response or "").strip())
+    except Exception:
         if log_failures:
-            log.debug("Stage-2 parse completely failed: %s", response_preview)
+            log.debug("Stage-2 non-JSON output dropped: %s", (response or "")[:200])
         return None, "failed"
-
-    # Convert values to binary labels
-    out: List[int] = []
-    conversion_failures = 0
-    for v in vals:
-        b = _to_binary_label(v)
-        if b is None:
-            conversion_failures += 1
-            b = default_label if default_label in (0, 1) else 1
-        out.append(int(b))
-
-    # Handle length mismatch
-    actual_len = len(out)
-    status = "exact"
-
-    if actual_len == expected_len:
-        status = "exact"
-    elif actual_len < expected_len:
-        pad_val = out[-1] if out else (default_label if default_label in (0, 1) else 1)
-        out.extend([pad_val] * (expected_len - actual_len))
-        status = "padded"
-        if log_failures:
-            log.debug("Stage-2 padded %d->%d: %s", actual_len, expected_len, response_preview)
-    else:
-        out = out[:expected_len]
-        status = "truncated"
-        if log_failures:
-            log.debug("Stage-2 truncated %d->%d: %s", actual_len, expected_len, response_preview)
-
-    if conversion_failures > 0 and status == "exact":
-        status = "fallback"
-
-    return out, status
+    vals = obj.get("reasoning_verified") if isinstance(obj, dict) else None
+    if not isinstance(vals, list) or len(vals) != expected_len:
+        return None, "failed"
+    out = []
+    for value in vals:
+        if type(value) is not int or value not in (0, 1):
+            return None, "failed"
+        out.append(value)
+    return out, "exact"
 
 
 def _extract_indexed_values(text: str, expected_len: int) -> Optional[List[int]]:

@@ -230,7 +230,7 @@ class TrainingConfig:
 @dataclass
 class GenerationConfig:
     cache_dir: str = field(default_factory=lambda: f"{CACHE_ROOT}/cached_features")
-    max_new_tokens: int = field(default_factory=lambda: _get_env_int("GEN_MAX_NEW_TOKENS", 256))
+    max_new_tokens: int = field(default_factory=lambda: _get_env_int("GEN_MAX_NEW_TOKENS", 768))
     do_sample: bool = False
     temperature: float = 1.0
     batch_size: int = field(default_factory=lambda: _get_env_int("GEN_BATCH_SIZE", 32))
@@ -284,7 +284,7 @@ class JudgeConfig:
     # a short per-step analysis before the label array), which needs room — 64 was
     # only enough for the bare array and truncated the analysis. 256 fits the CoT +
     # array for typical 3-6 step traces.
-    judge_max_new_tokens: int = field(default_factory=lambda: _get_env_int("JUDGE_MAX_NEW_TOKENS", 256))
+    judge_max_new_tokens: int = field(default_factory=lambda: _get_env_int("JUDGE_MAX_NEW_TOKENS", 512))
     judge_batch_size: int = 64
 
 

@@ -168,6 +168,9 @@ class SpaceNLIDataset(BaseTaskDataset):
     def get_question(self, raw_item: dict) -> str:
         return raw_item["hypothesis"]
 
+    def get_context(self, raw_item: dict) -> str:
+        return str(raw_item["premises"])
+
     def get_ground_truth(self, raw_item: dict) -> str:
         label = raw_item["label"]
         # After cast_column, label is an int index into LABELS; the manual

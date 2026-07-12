@@ -158,6 +158,8 @@ class VLLMGenerationEngine:
         feature_extractor: CombinedExtractor,
         max_new_tokens: int,
         use_attention: bool,
+        structured_json_schema=None,
+        structured_regex=None,
     ) -> GenerationResult:
         """Generate tokens with vLLM, extract features with HF forward pass.
 
@@ -177,11 +179,11 @@ class VLLMGenerationEngine:
             )
 
         # ---- Step 1: vLLM generation (fast) ----
-        sampling_params = self._SamplingParams(
-            max_tokens=max_new_tokens,
-            temperature=0,  # greedy decoding
-            n=1,
+        sampling_kwargs = {"max_tokens": max_new_tokens, "temperature": 0, "n": 1}
+        self._add_structured_output(
+            sampling_kwargs, structured_json_schema, structured_regex
         )
+        sampling_params = self._SamplingParams(**sampling_kwargs)
         vllm_outputs = self._vllm_engine.generate(
             prompts, sampling_params, use_tqdm=False
         )
@@ -300,6 +302,7 @@ class VLLMGenerationEngine:
         prompts: List[str],
         max_new_tokens: int,
         structured_json_schema=None,
+        structured_regex=None,
     ) -> List[str]:
         """Generate text without feature extraction (for judge.py).
 
@@ -317,26 +320,40 @@ class VLLMGenerationEngine:
             List of generated text strings.
         """
         sampling_kwargs = {"max_tokens": max_new_tokens, "temperature": 0, "n": 1}
-        if structured_json_schema is not None:
-            try:
-                from vllm.sampling_params import StructuredOutputsParams
-                sampling_kwargs["structured_outputs"] = StructuredOutputsParams(
-                    json=structured_json_schema
-                )
-            except Exception:
-                # Older vLLM: fall back to guided_decoding kwarg, else plain decode.
-                try:
-                    from vllm.sampling_params import GuidedDecodingParams
-                    sampling_kwargs["guided_decoding"] = GuidedDecodingParams(
-                        json=structured_json_schema
-                    )
-                except Exception:
-                    log.warning("vLLM build lacks structured-output support; decoding unconstrained.")
+        self._add_structured_output(
+            sampling_kwargs, structured_json_schema, structured_regex
+        )
         sampling_params = self._SamplingParams(**sampling_kwargs)
         vllm_outputs = self._vllm_engine.generate(
             prompts, sampling_params, use_tqdm=False
         )
         return [output.outputs[0].text for output in vllm_outputs]
+
+    @staticmethod
+    def _add_structured_output(
+        sampling_kwargs, structured_json_schema=None, structured_regex=None
+    ):
+        """Attach required JSON/regex guided decoding to vLLM sampling params."""
+        if structured_json_schema is not None and structured_regex is not None:
+            raise ValueError("Provide either structured_json_schema or structured_regex, not both")
+        if structured_json_schema is None and structured_regex is None:
+            return
+        kind = "json" if structured_json_schema is not None else "regex"
+        value = structured_json_schema if structured_json_schema is not None else structured_regex
+        try:
+            from vllm.sampling_params import StructuredOutputsParams
+            sampling_kwargs["structured_outputs"] = StructuredOutputsParams(**{kind: value})
+            return
+        except (ImportError, TypeError):
+            pass
+        try:
+            from vllm.sampling_params import GuidedDecodingParams
+            sampling_kwargs["guided_decoding"] = GuidedDecodingParams(**{kind: value})
+            return
+        except (ImportError, TypeError) as exc:
+            raise RuntimeError(
+                "This vLLM build does not support required JSON-schema guided decoding"
+            ) from exc
 
 
 def _pad_batch_results(batch_features, batch_top_probs, batch_log_likelihoods, device):

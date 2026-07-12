@@ -30,19 +30,22 @@ SCRIPT_DIR="/home/dy23a.fsu/popllm/SpatialMind/jobs"
 DATASET_NAME="${DATASET_NAME:-StepGame}"
 MODEL_NAME="${MODEL_NAME:-Llama-3.1-8B-Instruct}"
 JUDGE_MODEL_NAME="${JUDGE_MODEL_NAME:-Mistral-Small-3.2-24B-Instruct-2506}"
-CACHE_SUBDIR="example"
+CACHE_SUBDIR="${CACHE_SUBDIR:-constraint_example}"
 TRAIN_EPOCHS="${TRAIN_EPOCHS:-30}"
-TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-1024}"
-GEN_MAX_TRAIN="${GEN_MAX_TRAIN:-20000}"
-GEN_MAX_VAL="${GEN_MAX_VAL:-5000}"
-GEN_MAX_TEST="${GEN_MAX_TEST:-5000}"
-GEN_MAX_OOD="${GEN_MAX_OOD:-5000}"
+# Small-cache heads need enough optimizer steps; huge batches made the hybrid
+# early-stop after only ~18 updates while the 11k-parameter control kept improving.
+TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-128}"
+GEN_MAX_TRAIN="${GEN_MAX_TRAIN:-1000}"
+GEN_MAX_VAL="${GEN_MAX_VAL:-250}"
+GEN_MAX_TEST="${GEN_MAX_TEST:-500}"
+GEN_MAX_OOD="${GEN_MAX_OOD:-500}"
 # Quick-test head subset (full zoo runs in pipeline*.sh).
-HEAD_TYPES="${HEAD_TYPES:-spatialmind uhead saplma factoscope lookback_lens luh_light mlp}"
+HEAD_TYPES="${HEAD_TYPES:-spatialmind constraint_only spatialmind_neural uhead factoscope mlp}"
 
 source "${SCRIPT_DIR}/common.sh"
 read -ra ALL_HEAD_TYPES <<< "${HEAD_TYPES}"
-OOD_DATASETS=(); read -r -a OOD_DATASETS <<< "${OOD_DATASETS:-spartqa babi SpaRTUN SpaceNLI}"
+OOD_DATASETS_CONFIG="${OOD_DATASETS:-spartqa babi SpaRTUN SpaceNLI}"
+OOD_DATASETS=(); read -r -a OOD_DATASETS <<< "${OOD_DATASETS_CONFIG}"
 
 RUN_LOG="${LOGS_ROOT}/example.log"; mkdir -p "${LOGS_ROOT}"
 exec > >(tee -a "${RUN_LOG}") 2>&1

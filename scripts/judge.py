@@ -47,6 +47,7 @@ from config import Config
 from engine import get_engine
 from utils.chain_judge import (
     build_chain_stage1_prompt,
+    build_chain_stage1_schema,
     build_chain_stage2_prompt,
     build_chain_stage2_schema,
     parse_chain_stage1_output,
@@ -120,6 +121,10 @@ def parse_args():
                         help="Max new tokens for judge (overrides config)")
     parser.add_argument("--force", action="store_true",
                         help="Re-judge all samples, not just label=-1")
+    parser.add_argument(
+        "--preserve_trace_labels", action="store_true",
+        help="With --force, re-judge claims but keep existing deterministic trace labels.",
+    )
     return parser.parse_args()
 
 
@@ -269,6 +274,9 @@ def _judge_split(cache_dir, split, split_dir, args, engine, judge_model,
     total_incorrect = 0
     total_unparseable = 0
     total_processed = 0
+    total_dropped = 0
+    dropped_reasons = Counter()
+    dropped_by_trace_label = Counter()
 
     for chunk_idx in sorted(pending_by_chunk.keys()):
         chunk_path = chunk_files[chunk_idx]
@@ -278,11 +286,11 @@ def _judge_split(cache_dir, split, split_dir, args, engine, judge_model,
 
         chunk_data = torch.load(chunk_path, map_location="cpu", weights_only=False)
         pending_samples = [(chunk_idx, idx, chunk_data[idx]) for idx in pending_indices]
+        drop_indices = set()
 
         # Process this chunk's samples in batches
         for batch_start in range(0, len(pending_samples), judge_batch_size):
             batch = pending_samples[batch_start:batch_start + judge_batch_size]
-            stage1_answer_label = {}
 
             # ---------------- Stage 1: strict answer/conclusion ----------------
             stage1_prompts = []
@@ -306,7 +314,22 @@ def _judge_split(cache_dir, split, split_dir, args, engine, judge_model,
                     existing_label = int(existing_label)
                 except Exception:
                     existing_label = -1
-                preserve_sample_label = (not args.force) and existing_label in (0, 1)
+                preserve_sample_label = (
+                    existing_label in (0, 1)
+                    and (args.preserve_trace_labels or not args.force)
+                )
+
+                if preserve_sample_label:
+                    # Classification datasets already have an exact-match task
+                    # label. Do not invoke a redundant GT-aware LLM judge.
+                    sample["label"] = existing_label
+                    sample["answer_correct"] = bool(existing_label == 1)
+                    verified = sample.get("verified", [])
+                    if isinstance(verified, list) and len(verified) == len(claims):
+                        if 0 <= conclusion_pos < len(verified):
+                            verified[conclusion_pos] = existing_label
+                            sample["verified"] = verified
+                    continue
 
                 stage1_prompts.append(
                     build_chain_stage1_prompt(
@@ -320,35 +343,33 @@ def _judge_split(cache_dir, split, split_dir, args, engine, judge_model,
                 stage1_meta.append((ci, local_idx, conclusion_pos, existing_label, preserve_sample_label))
 
             if stage1_prompts:
-                stage1_outputs = engine.generate_text_only(stage1_prompts, judge_max_new_tokens)
+                stage1_outputs = engine.generate_text_only(
+                    stage1_prompts,
+                    judge_max_new_tokens,
+                    structured_json_schema=build_chain_stage1_schema(),
+                )
 
                 for response, (ci, local_idx, conclusion_pos, existing_label, preserve_sample_label) in zip(stage1_outputs, stage1_meta):
                     parsed = parse_chain_stage1_output(response)
                     answer_label = parsed.get("answer_label")
-                    key = (ci, local_idx)
                     sample = chunk_data[local_idx]
-
-                    if preserve_sample_label:
-                        sample["label"] = existing_label
-                        sample["answer_correct"] = bool(existing_label == 1)
-                        stage1_answer_label[key] = int(answer_label) if answer_label in (0, 1) else existing_label
-                    else:
-                        stage1_answer_label[key] = answer_label
-                        if answer_label in (0, 1):
-                            sample["label"] = int(answer_label)
-                            sample["answer_correct"] = bool(int(answer_label) == 1)
-                            if int(answer_label) == 1:
-                                total_correct += 1
-                            else:
-                                total_incorrect += 1
+                    if answer_label in (0, 1):
+                        sample["label"] = int(answer_label)
+                        sample["answer_correct"] = bool(int(answer_label) == 1)
+                        if int(answer_label) == 1:
+                            total_correct += 1
                         else:
-                            sample["label"] = -1
-                            sample["answer_correct"] = False
-                            total_unparseable += 1
-                            log.warning(
-                                "  Stage-1 unparseable for chunk=%d, idx=%d: %r",
-                                ci, local_idx, response[:120],
-                            )
+                            total_incorrect += 1
+                    else:
+                        sample["label"] = -1
+                        sample["answer_correct"] = False
+                        total_unparseable += 1
+                        drop_indices.add(local_idx)
+                        dropped_reasons["stage1_parse_failure"] += 1
+                        log.warning(
+                            "  Stage-1 unparseable for chunk=%d, idx=%d: %r",
+                            ci, local_idx, response[:120],
+                        )
 
                     claims = sample.get("claims", []) or []
                     if claims:
@@ -396,16 +417,12 @@ def _judge_split(cache_dir, split, split_dir, args, engine, judge_model,
                         conclusion_text = str(c.get("text", ""))
                 if not reasoning_texts:
                     continue
-                key = (ci, local_idx)
-                answer_label = stage1_answer_label.get(key)
                 stage2_prompts.append(
                     build_chain_stage2_prompt(
                         tokenizer=engine.tokenizer,
                         question=sample.get("question", ""),
-                        generated_text=sample.get("generated_text", ""),
+                        context=sample.get("context", ""),
                         reasoning_claims=reasoning_texts,
-                        conclusion_claim=conclusion_text,
-                        answer_label=answer_label,
                     )
                 )
                 stage2_meta.append((ci, local_idx, reasoning_positions))
@@ -428,18 +445,17 @@ def _judge_split(cache_dir, split, split_dir, args, engine, judge_model,
                     )
                     for j, i in enumerate(idxs):
                         stage2_outputs[i] = group_out[j]
-                stage2_parse_stats = {"exact": 0, "padded": 0, "truncated": 0, "fallback": 0, "inferred": 0, "failed": 0}
+                stage2_parse_stats = {"exact": 0, "failed": 0}
                 for response, (ci, local_idx, reasoning_positions) in zip(stage2_outputs, stage2_meta):
-                    key = (ci, local_idx)
-                    answer_label = stage1_answer_label.get(key)
                     parsed_reasoning, parse_status = parse_chain_stage2_output(
                         response,
                         expected_len=len(reasoning_positions),
-                        answer_label=answer_label,
                         log_failures=True,
                     )
                     stage2_parse_stats[parse_status] = stage2_parse_stats.get(parse_status, 0) + 1
                     if parsed_reasoning is None:
+                        drop_indices.add(local_idx)
+                        dropped_reasons["stage2_parse_failure"] += 1
                         continue
                     sample = chunk_data[local_idx]
                     claims = sample.get("claims", []) or []
@@ -462,6 +478,55 @@ def _judge_split(cache_dir, split, split_dir, args, engine, judge_model,
                 total_processed, total_pending, total_correct, total_incorrect, total_unparseable,
             )
 
+        # Final fail-closed contract: no imputation and no partially labeled
+        # sample survives. Physically remove failed rows from the cache.
+        for local_idx, sample in enumerate(chunk_data):
+            claims = sample.get("claims", []) or []
+            verified = sample.get("verified", []) or []
+            try:
+                label = int(sample.get("label", -1))
+            except Exception:
+                label = -1
+            verified_complete = isinstance(verified, list) and len(verified) == len(claims)
+            if verified_complete:
+                try:
+                    verified_complete = all(type(v) is int and v in (0, 1) for v in verified)
+                except Exception:
+                    verified_complete = False
+            claim_types = [
+                str(c.get("claim_type", "")).strip().lower()
+                for c in claims if isinstance(c, dict)
+            ]
+            if label not in (0, 1):
+                if local_idx not in drop_indices:
+                    dropped_reasons["invalid_trace_label"] += 1
+                drop_indices.add(local_idx)
+            elif not claims:
+                if local_idx not in drop_indices:
+                    dropped_reasons["no_claims"] += 1
+                drop_indices.add(local_idx)
+            elif (
+                len(claim_types) != len(claims)
+                or len(claims) < 2
+                or claim_types[-1] != "conclusion"
+                or claim_types.count("conclusion") != 1
+                or not any(t == "reasoning" for t in claim_types[:-1])
+                or any(t not in {"reasoning", "conclusion"} for t in claim_types)
+            ):
+                if local_idx not in drop_indices:
+                    dropped_reasons["invalid_claim_contract"] += 1
+                drop_indices.add(local_idx)
+            elif not verified_complete:
+                if local_idx not in drop_indices:
+                    dropped_reasons["incomplete_claim_labels"] += 1
+                drop_indices.add(local_idx)
+        if drop_indices:
+            for i in drop_indices:
+                dropped_by_trace_label[str(chunk_data[i].get("label", "invalid"))] += 1
+            chunk_data = [s for i, s in enumerate(chunk_data) if i not in drop_indices]
+            total_dropped += len(drop_indices)
+            log.warning("  Dropped %d failed samples from chunk %d", len(drop_indices), chunk_idx)
+
         # Save this chunk immediately after processing
         chunk_claim_type_label_ratio = _compute_claim_type_label_ratio(chunk_data)
         log.info("  Chunk %d claim_type_label_ratio=%s", chunk_idx, chunk_claim_type_label_ratio)
@@ -481,11 +546,13 @@ def _judge_split(cache_dir, split, split_dir, args, engine, judge_model,
     all_labels = []
     unparseable_samples = []
     total_claim_pending = 0
+    chunk_sample_counts = []
     # Use streaming counter instead of accumulating all samples
     type_label_counter = defaultdict(Counter)
 
     for chunk_idx, chunk_path in enumerate(chunk_files):
         chunk_data = torch.load(chunk_path, map_location="cpu", weights_only=False)
+        chunk_sample_counts.append(len(chunk_data))
         for sample_idx, sample in enumerate(chunk_data):
             label = sample.get("label", 1)
             all_labels.append(label)
@@ -542,6 +609,8 @@ def _judge_split(cache_dir, split, split_dir, args, engine, judge_model,
 
     manifest.update({
         "total_count": total_count,
+        "num_chunks": len(chunk_sample_counts),
+        "chunk_sample_counts": chunk_sample_counts,
         "total_correct": n_correct,
         "total_incorrect": n_incorrect,
         "correct_rate": correct_rate,
@@ -549,7 +618,12 @@ def _judge_split(cache_dir, split, split_dir, args, engine, judge_model,
         "total_pending": n_pending,
         "judge_model": judge_model,
         "judge_samples_processed": total_pending,
+        "judge_input_samples": total_pending,
+        "judge_full_split_pass": bool(total_pending == total_samples),
         "judge_unparseable": total_unparseable,
+        "judge_dropped_samples": total_dropped,
+        "judge_drop_reasons": dict(dropped_reasons),
+        "judge_dropped_by_trace_label": dict(dropped_by_trace_label),
         "total_claim_pending": total_claim_pending,
         "claim_type_label_ratio": overall_claim_type_label_ratio,
         "judge_unparseable_samples": unparseable_samples[:100],
@@ -560,9 +634,9 @@ def _judge_split(cache_dir, split, split_dir, args, engine, judge_model,
 
     log.info("=" * 70)
     log.info(
-        "Judge complete: total=%d, correct=%d (%.1f%%), incorrect=%d (%.1f%%), pending=%d, claim_pending=%d, unparseable=%d",
+        "Judge complete: total=%d, correct=%d (%.1f%%), incorrect=%d (%.1f%%), pending=%d, claim_pending=%d, unparseable=%d, dropped=%d",
         total_count, n_correct, correct_rate * 100, n_incorrect, incorrect_rate * 100,
-        n_pending, total_claim_pending, total_unparseable
+        n_pending, total_claim_pending, total_unparseable, total_dropped
     )
     log.info("Claim type label ratio: %s", overall_claim_type_label_ratio)
     log.info("Updated manifest: %s", manifest_path)

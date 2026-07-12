@@ -50,8 +50,8 @@ HF_TOKEN="${HF_TOKEN:-}"
 #
 # Backbones present on disk: Llama-3.1-8B-Instruct, Mistral-7B-Instruct-v0.3,
 # gemma-2-9b-it. Judge: Mistral-Small-3.2-24B-Instruct-2506.
-# Claim extraction uses the strict Reasoning/Conclusion format + regex (no extra
-# model); set CLAIM_EXTRACTOR_MODEL_NAME to enable an LLM extractor if desired.
+# vLLM backbone generation uses JSON-schema guided reasoning[] + conclusion.
+# Set CLAIM_EXTRACTOR_MODEL_NAME only to enable an additional guided extractor.
 ###############################################################################
 MODEL_NAME="${MODEL_NAME:-Llama-3.1-8B-Instruct}"
 DATASET_NAME="${DATASET_NAME:-StepGame}"
@@ -61,8 +61,12 @@ CLAIM_EXTRACTOR_BACKEND="${CLAIM_EXTRACTOR_BACKEND:-vllm}"
 CLAIM_EXTRACTOR_MAX_NEW_TOKENS="${CLAIM_EXTRACTOR_MAX_NEW_TOKENS:-256}"
 CLAIM_LABELER_MAX_NEW_TOKENS="${CLAIM_LABELER_MAX_NEW_TOKENS:-128}"
 # Stage-2 reasoning judge uses an analysis-first prompt; needs room for the CoT.
-JUDGE_MAX_NEW_TOKENS="${JUDGE_MAX_NEW_TOKENS:-256}"
+JUDGE_MAX_NEW_TOKENS="${JUDGE_MAX_NEW_TOKENS:-512}"
 DEFER_CLAIM_EXTRACTION="${DEFER_CLAIM_EXTRACTION:-1}"
+RUN_CONSTRAINT_DIAGNOSTICS="${RUN_CONSTRAINT_DIAGNOSTICS:-1}"
+REBUILD_CONSTRAINT_CACHE="${REBUILD_CONSTRAINT_CACHE:-1}"
+RUN_LEAKAGE_AUDIT="${RUN_LEAKAGE_AUDIT:-1}"
+CONSTRAINT_DIAGNOSTIC_MAX_SAMPLES="${CONSTRAINT_DIAGNOSTIC_MAX_SAMPLES:-10000}"
 
 # Judge rerun control.
 JUDGE_PENDING_SKIP_THRESHOLD="${JUDGE_PENDING_SKIP_THRESHOLD:-10}"
@@ -85,7 +89,7 @@ DOWNLOAD_DATASETS=(
 )
 
 # Cache directory (optionally namespaced by CACHE_SUBDIR, e.g. "example").
-CACHE_SUBDIR="${CACHE_SUBDIR:-}"
+CACHE_SUBDIR="${CACHE_SUBDIR:-constraint_v2}"
 if [[ -n "${CACHE_SUBDIR}" ]]; then
     CACHE_DIR="${CACHE_ROOT}/cached_features/${CACHE_SUBDIR}/${DATASET_NAME}/${MODEL_NAME}"
 else
@@ -101,6 +105,13 @@ fi
 ALL_HEAD_TYPES=(
     # Our method
     "spatialmind"
+    # Core novelty ablations
+    "constraint_only"
+    "spatialmind_neural"
+    "constraint_no_context"
+    "constraint_no_conflict"
+    "constraint_no_entailment"
+    "constraint_no_repair"
     # Supervised baselines
     "saplma"
     "factoscope"
@@ -123,7 +134,8 @@ ALL_HEAD_TYPES=(
     "abl_no_bank"
 )
 
-# Unsupervised baselines are evaluated jointly via `evaluate.py --eval_baselines`.
+# Unsupervised baselines, including the deterministic `constraint_rule`, are
+# evaluated jointly via `evaluate.py --eval_baselines`.
 
 ###############################################################################
 # Training Configuration
@@ -134,7 +146,7 @@ TRAIN_LEARNING_RATE="${TRAIN_LEARNING_RATE:-${LEARNING_RATE:-0.0002}}"
 LOSS_TYPE="${LOSS_TYPE:-balanced_bce}"        # bce | balanced_bce | focal (auto per-level pos_weight)
 LOSS_POS_WEIGHT="${LOSS_POS_WEIGHT:-0}"       # 0 = auto per-level; >0 overrides
 FOCAL_GAMMA="${FOCAL_GAMMA:-2.0}"
-TRACE_LOSS_WEIGHT="${TRACE_LOSS_WEIGHT:-0.5}"  # multi-task trace objective weight
+TRACE_LOSS_WEIGHT="${TRACE_LOSS_WEIGHT:-0.0}"  # headline protocol uses shared claim aggregation
 BEST_METRIC="${BEST_METRIC:-auroc}"            # sample-level model-selection metric
 
 # Multi-GPU controls.
@@ -149,7 +161,7 @@ EVAL_MAX_PARALLEL_HEADS="${EVAL_MAX_PARALLEL_HEADS:-}"
 GEN_BATCH_SIZE="${GEN_BATCH_SIZE:-32}"
 FREE_FORM_GEN_BATCH_SIZE="${FREE_FORM_GEN_BATCH_SIZE:-8}"
 BACKEND="${BACKEND:-vllm}"
-GEN_MAX_NEW_TOKENS="${GEN_MAX_NEW_TOKENS:-256}"
+GEN_MAX_NEW_TOKENS="${GEN_MAX_NEW_TOKENS:-768}"
 # Traces per cache chunk. Small => bounded host RAM during training (chunks are
 # tens of GB at full scale). 2500 ~ 6-10 GB/chunk for feature_dim ~4.4k.
 GEN_CHUNK_SIZE="${GEN_CHUNK_SIZE:-2500}"
@@ -193,6 +205,8 @@ setup_environment() {
     export LOSS_TYPE LOSS_POS_WEIGHT FOCAL_GAMMA TRACE_LOSS_WEIGHT BEST_METRIC
     export BACKEND GEN_MAX_NEW_TOKENS GEN_CHUNK_SIZE
     export DATALOADER_NUM_WORKERS MAX_CACHED_CHUNKS
+    export RUN_CONSTRAINT_DIAGNOSTICS REBUILD_CONSTRAINT_CACHE RUN_LEAKAGE_AUDIT
+    export CONSTRAINT_DIAGNOSTIC_MAX_SAMPLES
 
     # Compiler caches on persistent storage.
     export TORCHINDUCTOR_CACHE_DIR="${CACHE_ROOT}/.torchinductor"
@@ -273,6 +287,9 @@ cache_split_ready() {
     local cache_dir="$1" split="$2"
     local manifest="${cache_dir}/${split}/manifest.json"
     [[ -f "${manifest}" ]] || return 1
+    local schema
+    schema=$(grep -o '"cache_schema_version"[[:space:]]*:[[:space:]]*[0-9]\+' "${manifest}" | head -n1 | grep -o '[0-9]\+' || true)
+    [[ -n "${schema}" && "${schema}" -ge 2 ]] || return 1
     local expected
     expected=$(grep -o '"num_chunks"[[:space:]]*:[[:space:]]*[0-9]\+' "${manifest}" | head -n1 | grep -o '[0-9]\+' || true)
     [[ -n "${expected}" && "${expected}" -gt 0 ]] || return 1

@@ -148,6 +148,10 @@ class BabiDataset(BaseTaskDataset):
     def get_question(self, raw_item: dict) -> str:
         return raw_item["question"]
 
+    def get_context(self, raw_item: dict) -> str:
+        passage = raw_item["passage"]
+        return "\n".join(str(x) for x in passage) if isinstance(passage, list) else str(passage)
+
     def get_ground_truth(self, raw_item: dict) -> str:
         return raw_item["answer"]
 

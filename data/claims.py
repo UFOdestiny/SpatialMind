@@ -206,30 +206,18 @@ def _keep_reasoning_and_single_conclusion_claims(
     claims: List[SpatialClaim],
     max_reasoning_claims: int = 12,
 ) -> List[SpatialClaim]:
-    """Keep reasoning claims and exactly one final conclusion claim."""
+    """Validate the claim contract without trimming or repairing it."""
     reasoning_claims = [c for c in claims if c.claim_type == "reasoning"]
     conclusion_claims = [c for c in claims if c.claim_type == "conclusion"]
-
-    if len(reasoning_claims) > max_reasoning_claims:
-        reasoning_claims = reasoning_claims[: int(max_reasoning_claims)]
-
-    if conclusion_claims:
-        return reasoning_claims + [conclusion_claims[-1]]
-    return reasoning_claims
-
-
-def _synthesize_conclusion_text(generated_text: str) -> str:
-    text = (generated_text or "").strip()
-    if not text:
-        return ""
-    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-    if not lines:
-        return text
-    for ln in reversed(lines):
-        lower = ln.lower()
-        if "answer is" in lower or lower.startswith("conclusion:"):
-            return ln
-    return lines[-1]
+    if not reasoning_claims or len(reasoning_claims) > int(max_reasoning_claims):
+        return []
+    if len(conclusion_claims) != 1:
+        return []
+    if claims[-1].claim_type != "conclusion":
+        return []
+    if len(reasoning_claims) + 1 != len(claims):
+        return []
+    return claims
 
 
 def _token_spans_with_tokenizer(
@@ -266,6 +254,93 @@ def _span_to_token_ids(token_spans: List[Tuple[int, int]], start: int, end: int)
             continue
         ids.append(i)
     return ids
+
+
+def parse_structured_generation_output(raw: str) -> Optional[Tuple[List[str], str]]:
+    """Parse the exact guided-generation JSON contract."""
+    try:
+        obj = json.loads((raw or "").strip())
+    except Exception:
+        return None
+    if not isinstance(obj, dict) or set(obj) != {"reasoning", "conclusion"}:
+        return None
+    reasoning = obj.get("reasoning")
+    conclusion = obj.get("conclusion")
+    if not isinstance(reasoning, list) or not 1 <= len(reasoning) <= 6:
+        return None
+    if any(not isinstance(x, str) or not x.strip() for x in reasoning):
+        return None
+    if not isinstance(conclusion, str) or not conclusion.strip():
+        return None
+    return [x.strip() for x in reasoning], conclusion.strip()
+
+
+def extract_claims_from_structured_generation(
+    generated_text: str,
+    answer_correct: bool,
+    tokenizer=None,
+    generated_token_ids: Optional[List[int]] = None,
+) -> List[SpatialClaim]:
+    """Build aligned claims directly from guided backbone JSON output.
+
+    Claim strings are located in the original JSON text, so their token masks
+    remain aligned with the frozen features extracted from those exact tokens.
+    """
+    parsed = parse_structured_generation_output(generated_text)
+    if parsed is None:
+        return []
+    reasoning, conclusion = parsed
+    text = (generated_text or "").strip()
+    token_spans = _token_spans_with_tokenizer(text, tokenizer=tokenizer)
+    if not token_spans:
+        return []
+
+    claims: List[SpatialClaim] = []
+    search_pos = 0
+    used_spans = set()
+    for ctype, claim_text in [*(('reasoning', x) for x in reasoning), ('conclusion', conclusion)]:
+        # JSON encoding may escape a claim. Spatial outputs normally match the
+        # plain string; accept the JSON-encoded body as the exact serialized form.
+        candidates = [claim_text, json.dumps(claim_text, ensure_ascii=False)[1:-1]]
+        found = None
+        for candidate in candidates:
+            for start_at in (search_pos, 0):
+                start = text.find(candidate, start_at)
+                while start >= 0:
+                    span = (start, start + len(candidate))
+                    if span not in used_spans:
+                        found = span
+                        break
+                    start = text.find(candidate, start + 1)
+                if found is not None:
+                    break
+            if found is not None:
+                break
+        if found is None:
+            return []
+        aligned = _span_to_token_ids(token_spans, found[0], found[1])
+        if not aligned:
+            return []
+        used_spans.add(found)
+        search_pos = max(search_pos, found[1])
+        claims.append(
+            SpatialClaim(
+                text=claim_text,
+                claim_type=ctype,
+                aligned_token_ids=aligned,
+                verified=(1 if answer_correct else 0) if ctype == "conclusion" else PENDING_LABEL,
+            )
+        )
+
+    if generated_token_ids is not None:
+        if len(generated_token_ids) == 0:
+            return []
+        max_idx = len(generated_token_ids) - 1
+        for claim in claims:
+            claim.aligned_token_ids = [i for i in claim.aligned_token_ids if 0 <= i <= max_idx]
+            if not claim.aligned_token_ids:
+                return []
+    return claims
 
 
 def extract_claims_from_generation(
@@ -334,14 +409,7 @@ def extract_claims_from_generation(
                         claim.aligned_token_ids = [max_idx]
 
             if not any(c.claim_type == "conclusion" for c in claims):
-                claims.append(
-                    SpatialClaim(
-                        text=_synthesize_conclusion_text(text),
-                        claim_type="conclusion",
-                        aligned_token_ids=list(range(len(token_spans))),
-                        verified=1 if answer_correct else 0,
-                    )
-                )
+                return []
             claims = _keep_reasoning_and_single_conclusion_claims(claims, max_reasoning_claims=12)
             return claims
 
@@ -390,16 +458,11 @@ def extract_claims_from_generation(
             )
         )
 
-    # Fallback: at least keep one conclusion claim covering all generated tokens.
+    # Fail closed: format/extraction failures are dropped by the caller.
     if not claims:
-        claims.append(
-            SpatialClaim(
-                text=text,
-                claim_type="conclusion",
-                aligned_token_ids=list(range(len(token_spans))),
-                verified=1 if answer_correct else 0,
-            )
-        )
+        return []
+    if not any(c.claim_type == "conclusion" for c in claims):
+        return []
 
     claims = _keep_reasoning_and_single_conclusion_claims(claims, max_reasoning_claims=12)
 
@@ -425,44 +488,33 @@ def extract_claims_from_llm_output(
     Parse LLM-produced JSON claims and align them to generated text tokens.
 
     Expected JSON format:
-      {"claims": [{"claim_type": "reasoning|conclusion", "text": "...", "verified": 0|1}]}
-    or
-      [{"claim_type": "...", "text": "...", "verified": 0|1}, ...]
+      {"claims": [{"type": "reasoning|conclusion", "text": "..."}, ...]}
+
+    This parser is deliberately fail-closed. It does not extract an embedded
+    JSON substring, accept alternate keys, fall back to regex claims, discard
+    malformed items, or repair the claim sequence.
     """
     text = (generated_text or "").strip()
     if not text:
         return []
 
-    parsed_claims = []
     raw = (llm_output or "").strip()
-    if raw:
-        try:
-            json_candidate = raw
-            start_obj = raw.find("{")
-            start_arr = raw.find("[")
-            starts = [s for s in [start_obj, start_arr] if s >= 0]
-            if starts:
-                start = min(starts)
-                end_obj = raw.rfind("}")
-                end_arr = raw.rfind("]")
-                end = max(end_obj, end_arr)
-                if end >= start:
-                    json_candidate = raw[start : end + 1]
-            obj = json.loads(json_candidate)
-            if isinstance(obj, dict):
-                parsed_claims = obj.get("claims", [])
-            elif isinstance(obj, list):
-                parsed_claims = obj
-        except Exception:
-            parsed_claims = []
-
-    if not parsed_claims:
-        return extract_claims_from_generation(
-            generated_text=text,
-            answer_correct=answer_correct,
-            tokenizer=tokenizer,
-            generated_token_ids=generated_token_ids,
-        )
+    try:
+        obj = json.loads(raw)
+    except Exception:
+        return []
+    if not isinstance(obj, dict) or set(obj) != {"claims"}:
+        return []
+    parsed_claims = obj.get("claims")
+    if not isinstance(parsed_claims, list) or not 3 <= len(parsed_claims) <= 6:
+        return []
+    if any(not isinstance(item, dict) or set(item) != {"type", "text"} for item in parsed_claims):
+        return []
+    raw_types = [str(item["type"]).strip().lower() for item in parsed_claims]
+    if any(t not in CLAIM_TYPE2ID for t in raw_types):
+        return []
+    if raw_types[-1] != "conclusion" or raw_types.count("conclusion") != 1:
+        return []
 
     token_spans = _token_spans_with_tokenizer(text, tokenizer=tokenizer)
     lowered = text.lower()
@@ -470,48 +522,31 @@ def extract_claims_from_llm_output(
     claims: List[SpatialClaim] = []
 
     for item in parsed_claims:
-        if not isinstance(item, dict):
-            continue
-        ctype = _normalize_claim_type(str(item.get("claim_type", item.get("type", ""))))
-        ctext = _clean_claim_text(str(item.get("text", "")))
+        ctype = str(item["type"]).strip().lower()
+        ctext = _clean_claim_text(str(item["text"]))
         if ctype not in CLAIM_TYPE2ID or not ctext or _is_generic_claim_text(ctext):
-            continue
+            return []
 
         ctext_lower = ctext.lower()
         start = lowered.find(ctext_lower, search_pos)
         if start < 0:
             start = lowered.find(ctext_lower)
         if start < 0:
-            # Fallback: keep claim but align to all generated tokens.
-            aligned = list(range(len(token_spans)))
+            return []
+        end = start + len(ctext_lower)
+        aligned = _span_to_token_ids(token_spans, start, end)
+        search_pos = end
+        if not aligned:
+            return []
+
+        # Extraction and supervision are separate stages. Ignore any unsolicited
+        # `verified`/`label` field emitted by the extractor model: reasoning
+        # labels must come from the context-grounded Stage-2 judge, while the
+        # conclusion label is exactly the independently computed answer label.
+        if ctype == "conclusion":
+            verified = 1 if answer_correct else 0
         else:
-            end = start + len(ctext_lower)
-            aligned = _span_to_token_ids(token_spans, start, end)
-            search_pos = end
-            if not aligned:
-                aligned = list(range(len(token_spans)))
-
-        verified = None
-        raw_verified = item.get("verified", item.get("label", None))
-        if isinstance(raw_verified, bool):
-            verified = int(raw_verified)
-        elif isinstance(raw_verified, (int, float)) and int(raw_verified) in (0, 1):
-            verified = int(raw_verified)
-        elif isinstance(raw_verified, str):
-            rv = raw_verified.strip().lower()
-            # New convention: 1=correct/supported, 0=hallucinated/unsupported
-            if rv in {"1", "correct", "true", "supported"}:
-                verified = 1
-            elif rv in {"0", "incorrect", "false", "hallucinated", "unsupported"}:
-                verified = 0
-
-        if verified is None:
-            # Conclusion mirrors answer correctness; reasoning stays pending (-1)
-            # for the Stage-2 judge rather than defaulting to "correct".
-            if ctype == "conclusion":
-                verified = 1 if answer_correct else 0
-            else:
-                verified = PENDING_LABEL
+            verified = PENDING_LABEL
         claims.append(
             SpatialClaim(
                 text=ctext,
@@ -521,31 +556,17 @@ def extract_claims_from_llm_output(
             )
         )
 
-    if not claims:
-        return extract_claims_from_generation(
-            generated_text=text,
-            answer_correct=answer_correct,
-            tokenizer=tokenizer,
-            generated_token_ids=generated_token_ids,
-        )
-
-    if not any(c.claim_type == "conclusion" for c in claims):
-        claims.append(
-            SpatialClaim(
-                text=_synthesize_conclusion_text(text),
-                claim_type="conclusion",
-                aligned_token_ids=list(range(len(token_spans))),
-                verified=1 if answer_correct else 0,
-            )
-        )
-
     claims = _keep_reasoning_and_single_conclusion_claims(claims, max_reasoning_claims=12)
+    if not claims:
+        return []
 
     if generated_token_ids is not None:
+        if len(generated_token_ids) == 0:
+            return []
         max_idx = max(0, len(generated_token_ids) - 1)
         for claim in claims:
             claim.aligned_token_ids = [tid for tid in claim.aligned_token_ids if 0 <= tid <= max_idx]
             if not claim.aligned_token_ids:
-                claim.aligned_token_ids = [max_idx]
+                return []
 
     return claims

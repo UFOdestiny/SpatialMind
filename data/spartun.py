@@ -156,6 +156,9 @@ class SpaRTUNDataset(BaseTaskDataset):
     def get_question(self, raw_item: dict) -> str:
         return raw_item["question"]
 
+    def get_context(self, raw_item: dict) -> str:
+        return str(raw_item["story"])
+
     def get_ground_truth(self, raw_item: dict) -> str:
         """Return the pipe-joined 0-indexed positions of correct options.
 

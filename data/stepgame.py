@@ -214,6 +214,9 @@ class StepGameDataset(BaseTaskDataset):
     def get_question(self, raw_item: dict) -> str:
         return raw_item["question"]
 
+    def get_context(self, raw_item: dict) -> str:
+        return " ".join(str(x) for x in raw_item["story"])
+
     def get_ground_truth(self, raw_item: dict) -> str:
         return raw_item["label"]
 

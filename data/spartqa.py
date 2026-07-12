@@ -186,6 +186,9 @@ class SpartQADataset(BaseTaskDataset):
     def get_question(self, raw_item: dict) -> str:
         return raw_item["question"]
 
+    def get_context(self, raw_item: dict) -> str:
+        return str(raw_item["story"])
+
     def get_ground_truth(self, raw_item: dict) -> str:
         """Return 0-indexed answer string for consistent comparison with parse_answer."""
         answer_idx = raw_item["answer"]

@@ -93,6 +93,13 @@ class BaseTaskDataset(Dataset, ABC):
         """Extract the question text from a raw item (used by judge)."""
         return raw_item.get("question", "")
 
+    def get_context(self, raw_item: dict) -> str:
+        """Return the trusted scene/premise text used by constraint analysis."""
+        value = raw_item.get("story", raw_item.get("passage", raw_item.get("premises", "")))
+        if isinstance(value, (list, tuple)):
+            return " ".join(str(x) for x in value)
+        return str(value or "")
+
     def get_ground_truth(self, raw_item: dict) -> str:
         """Extract the ground truth answer string from a raw item."""
         return raw_item.get("label", "")

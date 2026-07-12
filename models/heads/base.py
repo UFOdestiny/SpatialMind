@@ -53,6 +53,8 @@ class UncertaintyHeadBase(nn.Module):
     supports_claim_inputs: bool = True
     #: Whether the head emits its own learned trace-level logit.
     emits_trace_logit: bool = False
+    #: Whether the head consumes explicit per-claim/per-trace constraint features.
+    supports_constraint_inputs: bool = False
 
     def __init__(self, feature_dim: int, num_classes: int = 1):
         super().__init__()
@@ -97,6 +99,8 @@ class UncertaintyHeadBase(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         claim_masks: Optional[List[torch.Tensor]] = None,
         claim_types: Optional[List[torch.Tensor]] = None,
+        claim_constraint_features: Optional[List[torch.Tensor]] = None,
+        trace_constraint_features: Optional[torch.Tensor] = None,
     ) -> HeadOutput:
         bsz = features.shape[0]
         device = features.device
@@ -107,14 +111,28 @@ class UncertaintyHeadBase(nn.Module):
             # Degenerate path: treat the whole (valid) trace as a single claim.
             claim_masks = [attention_mask[i].unsqueeze(0).float() for i in range(bsz)]
 
-        per_trace_logits = self.forward_claims(features, attention_mask, claim_masks, claim_types)
+        if self.supports_constraint_inputs:
+            per_trace_logits = self.forward_claims(
+                features, attention_mask, claim_masks, claim_types,
+                claim_constraint_features=claim_constraint_features,
+                trace_constraint_features=trace_constraint_features,
+            )
+        else:
+            per_trace_logits = self.forward_claims(features, attention_mask, claim_masks, claim_types)
         claim_logits, claim_mask = self._pack(per_trace_logits, device)
 
         trace_logit = None
         if self.emits_trace_logit:
-            trace_logit = self.forward_trace(
-                features, attention_mask, per_trace_logits, claim_masks, claim_types
-            )
+            if self.supports_constraint_inputs:
+                trace_logit = self.forward_trace(
+                    features, attention_mask, per_trace_logits, claim_masks, claim_types,
+                    claim_constraint_features=claim_constraint_features,
+                    trace_constraint_features=trace_constraint_features,
+                )
+            else:
+                trace_logit = self.forward_trace(
+                    features, attention_mask, per_trace_logits, claim_masks, claim_types
+                )
         return HeadOutput(claim_logits=claim_logits, claim_mask=claim_mask, trace_logit=trace_logit)
 
     # ------------------------------------------------------------------ #

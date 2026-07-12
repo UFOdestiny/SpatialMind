@@ -52,6 +52,7 @@ from models.unsup_heads import build_estimator, UNSUPERVISED_HEAD_REGISTRY
 from models.wrapper import ClaimUQModel
 from scripts.metrics import compute_all_metrics, compute_claim_metrics
 from scripts.trainer import collect_predictions, score_trace_level, _amp_dtype
+from spatial_constraints import CLAIM_CONSTRAINT_DIM, TRACE_CONSTRAINT_DIM
 from utils.common import collate_claim_traces
 from utils.efficiency import get_gpu_peak_memory_gb, reset_gpu_peak_memory
 
@@ -85,14 +86,18 @@ def parse_args():
     p.add_argument("--calibrate", type=str, default="auto",
                    choices=["auto", "structural", "standard", "none"],
                    help="Post-hoc trace-score calibration, FIT ON VALIDATION and applied to test. "
-                        "'auto': structural for spatialmind, standard (Platt) for other heads/baselines.")
+                        "'auto': the same rank-preserving positive-slope Platt map for every "
+                        "head/baseline. Use 'structural' only for a secondary non-monotonic analysis.")
     p.add_argument("--struct_calib_C", type=float, default=0.01,
                    help="Inverse L2 strength for the structural calibrator (smaller = stronger reg).")
     return p.parse_args()
 
 
-# The head whose per-claim probabilities carry re-orderable structural signal.
-STRUCTURAL_CALIB_HEADS = {"spatialmind"}
+# Main comparisons use the same rank-preserving calibration for every method.
+# Non-monotonic structural stacking remains available only as an explicitly
+# requested secondary analysis (--calibrate structural), never in the headline
+# auto protocol.
+STRUCTURAL_CALIB_HEADS = set()
 
 
 def _calib_mode_for(head_type: str, requested: str) -> str:
@@ -186,6 +191,17 @@ def evaluate_head(args, cfg, cache_dir, output_dir, difficulty_field):
         n_layers=head_cfg.get("n_layers", 2), n_heads=head_cfg.get("n_heads", 8),
         dropout=head_cfg.get("dropout", 0.1), max_seq_len=head_cfg.get("max_seq_len", 512),
     )
+    if getattr(head, "supports_constraint_inputs", False):
+        expected = (CLAIM_CONSTRAINT_DIM, TRACE_CONSTRAINT_DIM)
+        saved = (
+            int(head_cfg.get("claim_constraint_dim", -1)),
+            int(head_cfg.get("trace_constraint_dim", -1)),
+        )
+        if saved != expected:
+            raise ValueError(
+                f"constraint head/cache contract mismatch: checkpoint={saved}, runtime={expected}; "
+                "retrain with the current native constraint schema"
+            )
     head.load_state_dict(torch.load(os.path.join(args.head_path, "head_weights.pth"), map_location="cpu"))
     model = ClaimUQModel(head=head, num_classes=head_cfg.get("num_classes", 1)).to(device)
     amp_dtype = _amp_dtype(cfg.training.amp_dtype)
@@ -221,8 +237,11 @@ def evaluate_head(args, cfg, cache_dir, output_dir, difficulty_field):
             log.info("Re-selected aggregation on %s: %s", args.val_split, aggregation)
         else:
             log.info("Using fixed aggregation: %s", aggregation)
-    except FileNotFoundError:
-        log.info("No %s split in eval cache; using aggregation: %s", args.val_split, aggregation)
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(
+            f"Strict evaluation requires a disjoint '{args.val_split}' cache; "
+            "test-fitted aggregation/calibration is forbidden"
+        ) from exc
 
     reset_gpu_peak_memory(device)
     t0 = time.time()
@@ -324,7 +343,12 @@ def _collect_baseline_uncertainty(estimator, ds):
             if lbl not in (0, 1):
                 continue
             idxs = list(range(len(claims))) if claims else [0]
-        unc = estimator.estimate_claims(raw)
+        # Estimators receive no supervision fields, even though the evaluator
+        # retains them separately for metrics/alignment. This makes accidental
+        # baseline access to gold answers or labels impossible by construction.
+        forbidden = {"label", "verified", "ground_truth", "ground_truth_dir", "answer_correct"}
+        estimator_input = {k: v for k, v in raw.items() if k not in forbidden}
+        unc = estimator.estimate_claims(estimator_input)
         if unc is None:
             unc = [0.5] * len(claims)
         types = [int(claims[ci].get("claim_type_id", 2)) if ci < len(claims) else 2 for ci in idxs]
@@ -394,16 +418,11 @@ def evaluate_baselines(args, cfg, cache_dir, output_dir, difficulty_field, names
                 for name in names}
     try:
         val_ds = CachedFeatureDataset(cache_dir, args.val_split, max_cached_chunks=2)
-    except FileNotFoundError:
-        val_ds = None
-
-    if val_ds is None:
-        log.warning(
-            "No '%s' split in eval cache: baseline normalization+aggregation fall back to "
-            "the %s split (acceptable for OOD, where the confidence scale is uncalibrated; "
-            "AUROC/PR-AUC are unaffected as they are rank-based).",
-            args.val_split, args.split,
-        )
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(
+            f"Strict baseline evaluation requires a disjoint '{args.val_split}' cache; "
+            "test-fitted normalization is forbidden"
+        ) from exc
 
     agg_mode = args.aggregation or cfg.head.aggregation
     for name in names:
@@ -413,7 +432,7 @@ def evaluate_baselines(args, cfg, cache_dir, output_dir, difficulty_field, names
         # which we warned about above. The claim->trace rule itself is FIXED
         # (cfg.head.aggregation, default "conc") unless --aggregation auto is
         # passed, in which case it is re-selected on the reference split.
-        ref_ds = val_ds if val_ds is not None else test_ds
+        ref_ds = val_ds
         ref_unc, ref_types, ref_labels, _ = _collect_baseline_uncertainty(estimator, ref_ds)
         norm_stats = _fit_norm_stats(ref_unc)
         aggregation = {"method": "conc", "mix_weights": None} if agg_mode == "auto" else {"method": agg_mode, "mix_weights": None}

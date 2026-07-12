@@ -102,7 +102,7 @@ run_generation() {
             --dataset "${DATASET_NAME}" \
             --split "${splits}" \
             --max_samples "${max_samples}" \
-            --max_new_tokens "${GEN_MAX_NEW_TOKENS:-256}" \
+            --max_new_tokens "${GEN_MAX_NEW_TOKENS:-768}" \
             --backend "${BACKEND:-vllm}" \
             --model_path "${MODEL_PATH}" \
             --dataset_path "${DATASET_PATH}" \
@@ -134,7 +134,7 @@ run_judge() {
     "${PYTHON_BIN:-python}" scripts/judge.py \
         --cache_dir "${CACHE_DIR}" --split "${splits}" \
         --judge_model "${JUDGE_MODEL_PATH}" --judge_backend "${BACKEND:-vllm}" \
-        --judge_max_new_tokens "${JUDGE_MAX_NEW_TOKENS:-256}" \
+        --judge_max_new_tokens "${JUDGE_MAX_NEW_TOKENS:-512}" \
         2>&1 | tee "${LOGS_ROOT}/data/judge_${DATASET_NAME}.log"
     return ${PIPESTATUS[0]}
 }
@@ -151,6 +151,33 @@ run_phase1() {
         run_judge "${splits}"
     else
         echo "  [SKIP] Judge: all splits below pending threshold."
+    fi
+    if [[ "${REBUILD_CONSTRAINT_CACHE:-1}" == "1" ]]; then
+        print_step "Phase 1.6: Rebuild Native Constraint View"
+        "${PYTHON_BIN:-python}" scripts/rebuild_constraint_cache.py \
+            --cache_dir "${CACHE_DIR}" --split "${splits}"
+    fi
+    if [[ "${RUN_LEAKAGE_AUDIT:-1}" == "1" ]]; then
+        print_step "Phase 1.7: Fail-Closed Leakage Audit"
+        "${PYTHON_BIN:-python}" scripts/leakage_audit.py \
+            --cache_dir "${CACHE_DIR}" --splits "${splits}" \
+            --output "${LOGS_ROOT}/data/leakage_audit_${DATASET_NAME}.json"
+    fi
+    if [[ "${RUN_CONSTRAINT_DIAGNOSTICS:-1}" == "1" ]]; then
+        local split parts=(); IFS=',' read -ra parts <<< "${splits}"
+        for split in "${parts[@]}"; do
+            split="${split// /}"; [[ -n "${split}" ]] || continue
+            "${PYTHON_BIN:-python}" scripts/constraint_diagnostics.py \
+                --cache_dir "${CACHE_DIR}" --split "${split}" \
+                --max_samples "${CONSTRAINT_DIAGNOSTIC_MAX_SAMPLES:-10000}" \
+                --output "${LOGS_ROOT}/data/constraints_${DATASET_NAME}_${split}.json"
+            if [[ "${split}" == "test" && "${RUN_CONSTRAINT_COUNTERFACTUAL:-1}" == "1" ]]; then
+                "${PYTHON_BIN:-python}" scripts/constraint_counterfactual.py \
+                    --cache_dir "${CACHE_DIR}" --split "${split}" \
+                    --max_samples "${CONSTRAINT_DIAGNOSTIC_MAX_SAMPLES:-10000}" \
+                    --output "${LOGS_ROOT}/data/counterfactual_${DATASET_NAME}_${split}.json"
+            fi
+        done
     fi
     echo "Phase 1 completed in $(format_duration $(( $(date +%s) - t0 )))."
 }

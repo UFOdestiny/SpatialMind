@@ -14,6 +14,9 @@ Each cached sample dict (see the Phase-1 data contract) contains:
     claims          list[dict]  {text, claim_type, claim_type_id, aligned_token_ids, ...}
     k_hop           int
     token_probs, log_likelihoods, question, generated_text, ...
+    context                     trusted scene/premise text
+    claim_constraint_features   (C, D_c) explicit relation-algebra features
+    trace_constraint_features   (D_t,) explicit trace-consistency features
 
 This dataset is TRACE-first: __getitem__ returns one trace with its ordered
 claims, per-claim labels, and the trace-level label, ready for the claim-level
@@ -35,6 +38,7 @@ import os
 
 import torch
 from torch.utils.data import Dataset, Sampler
+from spatial_constraints import CLAIM_CONSTRAINT_DIM
 
 log = logging.getLogger(__name__)
 
@@ -106,6 +110,14 @@ class CachedFeatureDataset(Dataset):
             )
         with open(manifest_path, "r") as f:
             self.manifest = json.load(f)
+        if int(self.manifest.get("cache_schema_version", 0)) < 2:
+            raise ValueError(
+                f"Legacy cache schema at {manifest_path}; regenerate with the explicit-constraint pipeline"
+            )
+        if skip_pending and int(self.manifest.get("total_pending", 0)) != 0:
+            raise ValueError(f"{manifest_path}: trace labels remain pending; run the judge first")
+        if skip_pending and int(self.manifest.get("total_claim_pending", 0)) != 0:
+            raise ValueError(f"{manifest_path}: claim labels remain pending; run the judge first")
 
         self.total_count = self.manifest.get("total_count", 0)
         self.chunk_size = self.manifest.get("chunk_size", 0)
@@ -178,40 +190,44 @@ class CachedFeatureDataset(Dataset):
 
     @staticmethod
     def _usable_claims(sample: dict):
-        """Return (claims, claim_labels) filtered to claims with a 0/1 label.
-
-        Falls back to the sample-level label when per-claim `verified` is absent.
-        """
+        """Return the complete claim sequence under a fail-closed label contract."""
         claims = sample.get("claims", []) or []
         verified = sample.get("verified", []) or []
-        out_claims, out_labels = [], []
-        if verified:
-            for ci, claim in enumerate(claims):
-                if ci >= len(verified):
-                    break
-                v = int(verified[ci])
-                if v in (0, 1):
-                    out_claims.append(claim)
-                    out_labels.append(v)
-        if not out_claims:
-            # No usable per-claim labels: treat the whole trace as a single claim.
-            label = int(sample.get("label", 1))
-            label = label if label in (0, 1) else 1
-            out_claims = [{"claim_type_id": 2, "aligned_token_ids": []}]
-            out_labels = [label]
-        return out_claims, out_labels
+        constraint_features = sample.get("claim_constraint_features")
+        if constraint_features is None:
+            raise ValueError(
+                "Cache lacks native explicit-constraint features. Regenerate it with "
+                "the constraint-aware Phase-1 pipeline (cache_schema_version >= 2)."
+            )
+        constraint_features = torch.as_tensor(constraint_features, dtype=torch.float32)
+        if not claims:
+            raise ValueError("cache sample has no extracted claims")
+        if len(verified) != len(claims):
+            raise ValueError("claim/verified length mismatch in cache")
+        labels = [int(v) for v in verified]
+        if any(v not in (0, 1) for v in labels):
+            raise ValueError("pending/invalid claim label reached train/evaluation loader")
+        if constraint_features.shape[0] != len(claims):
+            raise ValueError("claim/constraint feature length mismatch in cache")
+        return claims, labels, constraint_features
 
     def __getitem__(self, idx):
         chunk_idx, local_idx = self._index[idx]
         sample = self._load_chunk(chunk_idx)[local_idx]
-        claims, claim_labels = self._usable_claims(sample)
-        trace_label = int(sample.get("label", 1))
-        trace_label = trace_label if trace_label in (0, 1) else 1
+        claims, claim_labels, claim_constraint_features = self._usable_claims(sample)
+        trace_constraint_features = sample.get("trace_constraint_features")
+        if trace_constraint_features is None:
+            raise ValueError("Cache lacks trace_constraint_features; regenerate Phase-1 cache")
+        trace_label = int(sample.get("label", PENDING))
+        if trace_label not in (0, 1):
+            raise ValueError("pending/invalid trace label reached train/evaluation loader")
         return {
             "features": sample["features"],
             "attention_mask": sample["attention_mask"],
             "claims": claims,
             "claim_labels": claim_labels,
+            "claim_constraint_features": claim_constraint_features,
+            "trace_constraint_features": torch.as_tensor(trace_constraint_features, dtype=torch.float32),
             "trace_label": trace_label,
             "k_hop": int(sample.get("k_hop", 0)),
         }
@@ -251,7 +267,7 @@ class CachedFeatureDataset(Dataset):
         for chunk_idx in sorted(chunk_to_locals):
             chunk = torch.load(self.chunk_files[chunk_idx], map_location="cpu", weights_only=False)
             for local_idx in chunk_to_locals[chunk_idx]:
-                _, labels = self._usable_claims(chunk[local_idx])
+                _, labels, _ = self._usable_claims(chunk[local_idx])
                 total += len(labels)
                 correct += sum(labels)
             del chunk

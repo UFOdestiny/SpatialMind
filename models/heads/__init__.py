@@ -6,7 +6,16 @@ baselines live in `models.unsup_heads`.
 """
 
 from models.heads.base import HeadOutput, UncertaintyHeadBase
-from models.heads.spatialmind_head import SpatialMindHead
+from models.heads.spatialmind_head import (
+    ConstraintOnlyHead,
+    ConstraintNoConflictHead,
+    ConstraintNoContextHead,
+    ConstraintNoEntailmentHead,
+    ConstraintNoRepairHead,
+    ConstraintSpatialMindHead,
+    NeuralSpatialMindHead,
+    SpatialMindHead,
+)
 from models.heads.baselines import (
     CNNHead,
     FactoscopeHead,
@@ -31,8 +40,15 @@ from models.heads.ablations import (
 
 HEAD_REGISTRY = {
     # Our method
-    "spatialmind": SpatialMindHead,
-    "uq": SpatialMindHead,  # legacy alias
+    "spatialmind": ConstraintSpatialMindHead,
+    "constraint_spatialmind": ConstraintSpatialMindHead,
+    "constraint_only": ConstraintOnlyHead,
+    "spatialmind_neural": NeuralSpatialMindHead,
+    "constraint_no_context": ConstraintNoContextHead,
+    "constraint_no_conflict": ConstraintNoConflictHead,
+    "constraint_no_entailment": ConstraintNoEntailmentHead,
+    "constraint_no_repair": ConstraintNoRepairHead,
+    "uq": ConstraintSpatialMindHead,
 
     # Supervised baselines
     "saplma": SaplmaHead,

@@ -10,7 +10,7 @@ pipeline already fits the aggregation rule and baseline normalization on validat
        provably unchanged; only calibration (ECE/Brier/NLL) and threshold metrics
        move. This is the conventional post-hoc calibration baselines get.
 
-    2. StructuralCalibrator (SpatialMind): a regularized logistic model over
+    2. StructuralCalibrator (optional secondary analysis): a regularized logistic model over
        STRUCTURAL FEATURES of the per-claim probability sequence, ANCHORED on the
        raw trace score (the raw logit is an input feature). Because it re-reads the
        claim vector, the resulting score is NON-monotonic in the old score, so it
@@ -19,8 +19,9 @@ pipeline already fits the aggregation rule and baseline normalization on validat
        regularization makes it degrade gracefully to the raw score when structure
        is uninformative.
 
-Design principle (fairness): baselines get StandardCalibrator; SpatialMind gets
-StructuralCalibrator. Both are post-hoc, both fit on validation only.
+Design principle (fairness): the headline comparison gives every learned method
+the same rank-preserving StandardCalibrator.  StructuralCalibrator is available
+only as an explicitly requested secondary analysis because it can change ranking.
 """
 from __future__ import annotations
 
@@ -79,7 +80,7 @@ N_STRUCT_FEATURES = _trace_features([0.5, 0.5]).shape[0]
 class StandardCalibrator:
     """Platt scaling in logit space: p' = sigmoid(a*logit(s) + b).
 
-    Monotonic (a>0 typically) => rank metrics unchanged; fixes prior shift (b) and
+    Strictly monotonic (a>0 by construction) => rank metrics unchanged; fixes prior shift (b) and
     sharpness (a). Falls back to identity if the fit is degenerate.
     """
 
@@ -95,14 +96,24 @@ class StandardCalibrator:
         if np.unique(y).size < 2:
             return self  # cannot fit; identity
 
+        # Optimise log(a), rather than a itself.  An unconstrained Platt fit can
+        # choose a negative slope on a noisy validation split and silently
+        # reverse every test ranking.  Besides being unfair, that contradicts
+        # the advertised rank-preserving evaluation protocol.
         def nll(w):
-            a, b = w
-            p = np.clip(expit(a * z + b), EPS, 1 - EPS)
-            return -np.mean(y * np.log(p) + (1 - y) * np.log(1 - p))
+            log_a, b = w
+            a = np.exp(log_a)
+            logits = a * z + b
+            return float(np.mean(np.logaddexp(0.0, logits) - y * logits))
 
-        r = minimize(nll, [1.0, 0.0], method="Nelder-Mead")
+        prior = float(np.clip(y.mean(), EPS, 1 - EPS))
+        x0 = np.array([0.0, float(logit(prior))], dtype=np.float64)
+        r = minimize(
+            nll, x0, method="L-BFGS-B",
+            bounds=[(np.log(1e-6), np.log(1e3)), (-30.0, 30.0)],
+        )
         if r.success or np.isfinite(r.fun):
-            self.a, self.b = float(r.x[0]), float(r.x[1])
+            self.a, self.b = float(np.exp(r.x[0])), float(r.x[1])
             self.fitted = True
         return self
 
