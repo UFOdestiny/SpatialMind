@@ -18,6 +18,7 @@ from data.stepgame import (
 )
 from data.babi import BabiDataset
 from data.spartqa import SpartQADataset
+from data.spartqa_yn import SpartQAYNDataset
 from data.spartun import SpaRTUNDataset
 from data.spacenli import SpaceNLIDataset
 from data.base import BaseTaskDataset
@@ -28,6 +29,8 @@ DATASET_REGISTRY = {
     "babi": BabiDataset,
     "spartqa": SpartQADataset,
     "SpartQA": SpartQADataset,        # folder name alias
+    "spartqa_yn": SpartQAYNDataset,
+    "SpartQA_YN": SpartQAYNDataset,   # folder name alias
     "spartun": SpaRTUNDataset,
     "SpaRTUN": SpaRTUNDataset,        # folder name alias
     "spacenli": SpaceNLIDataset,
