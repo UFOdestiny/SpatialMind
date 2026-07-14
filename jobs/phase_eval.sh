@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 ###############################################################################
-# p3.sh - Phase 3: sample-level evaluation (ID + OOD) for heads + baselines.
+# phase_eval.sh - sample-level evaluation (ID + OOD) for heads + baselines.
 #
-# Sourced by pipelines (provides run_phase3), or run directly:
-#   sbatch jobs/p3.sh
-#   HEAD_TYPES="spatialmind uhead" bash jobs/p3.sh
+# Sourced by run scripts (provides run_phase3), or run directly:
+#   sbatch jobs/phase_eval.sh
+#   HEAD_TYPES="spatialmind uhead" bash jobs/phase_eval.sh
 #
 # Layout produced (consumed by utils/results.py):
 #   ${RESULTS_ROOT}/eval/<head>/evaluation_report.json                (ID head)
@@ -12,7 +12,7 @@
 #   ${RESULTS_ROOT}/eval_ood/<dataset>/<head>/evaluation_report.json   (OOD head)
 ###############################################################################
 
-#SBATCH --job-name=sm-p3
+#SBATCH --job-name=sm-eval
 #SBATCH --account=fsu-compsci-dept
 #SBATCH --qos=fsu-compsci-dept
 #SBATCH --nodes=1
@@ -157,7 +157,7 @@ if [[ ${_P3_SOURCED} -eq 0 ]]; then
     source "${SCRIPT_DIR}/common.sh"
     [[ -n "${HEAD_TYPES:-}" ]] && read -ra ALL_HEAD_TYPES <<< "${HEAD_TYPES}"
     OOD_DATASETS=(); read -r -a OOD_DATASETS <<< "${OOD_DATASETS:-}"
-    RUN_LOG="${LOGS_ROOT}/p3.log"; mkdir -p "${LOGS_ROOT}"
+    RUN_LOG="${LOGS_ROOT}/phase_eval.log"; mkdir -p "${LOGS_ROOT}"
     exec > >(tee -a "${RUN_LOG}") 2>&1
     setup_environment; detect_gpus
     MODEL_PATH="${MODELS_ROOT}/${MODEL_NAME}"

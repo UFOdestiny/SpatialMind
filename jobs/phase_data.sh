@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 ###############################################################################
-# p1.sh - Phase 0 (download) + Phase 1 (generate -> claim-extract -> judge)
+# phase_data.sh - downloads + data phase (generate -> claim-extract -> judge)
 #
-# Sourced by pipeline scripts (provides run_phase0 / run_phase1), or run directly:
-#   sbatch jobs/p1.sh
-#   DATASET_NAME=StepGame MODEL_NAME=Llama-3.1-8B-Instruct bash jobs/p1.sh
+# Sourced by run scripts (provides run_phase0 / run_phase1), or run directly:
+#   sbatch jobs/phase_data.sh
+#   DATASET_NAME=StepGame MODEL_NAME=Llama-3.1-8B-Instruct bash jobs/phase_data.sh
 ###############################################################################
 
-#SBATCH --job-name=sm-p1
+#SBATCH --job-name=sm-data
 #SBATCH --account=fsu-compsci-dept
 #SBATCH --qos=fsu-compsci-dept
 #SBATCH --nodes=1
@@ -190,7 +190,7 @@ if [[ ${_P1_SOURCED} -eq 0 ]]; then
     SCRIPT_DIR="/home/dy23a.fsu/popllm/SpatialMind/jobs"
     source "${SCRIPT_DIR}/common.sh"
     OOD_DATASETS=(); read -r -a OOD_DATASETS <<< "${OOD_DATASETS:-}"
-    RUN_LOG="${LOGS_ROOT}/p1.log"; mkdir -p "${LOGS_ROOT}"
+    RUN_LOG="${LOGS_ROOT}/phase_data.log"; mkdir -p "${LOGS_ROOT}"
     exec > >(tee -a "${RUN_LOG}") 2>&1
     setup_environment
 

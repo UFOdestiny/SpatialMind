@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 ###############################################################################
-# example.sh - SpatialMind quick-test pipeline (small samples, all phases).
+# smoke.sh - SpatialMind quick-test pipeline (small samples, all phases).
 #
-#   sbatch jobs/example.sh
-#   bash jobs/example.sh                          # run without SLURM
-#   GEN_MAX_TRAIN=2000 TRAIN_EPOCHS=15 bash jobs/example.sh
+#   sbatch jobs/smoke.sh
+#   bash jobs/smoke.sh                             # run without SLURM
+#   GEN_MAX_TRAIN=2000 TRAIN_EPOCHS=15 bash jobs/smoke.sh
 #
-# Small-scale end-to-end smoke test on StepGame(ID) -> spartqa/babi(OOD).
-# Uses a separate cache namespace (CACHE_SUBDIR=example) so it never collides
-# with a full run. All artifacts land under <repo>/spatialmind.
+# Small-scale end-to-end smoke test on StepGame(ID) -> OOD sets.
+# Uses a separate cache namespace (CACHE_SUBDIR=constraint_example) so it never
+# collides with a full run. All artifacts land under <repo>/spatialmind.
 ###############################################################################
 
 #SBATCH --job-name=smind-ex
@@ -39,7 +39,7 @@ GEN_MAX_TRAIN="${GEN_MAX_TRAIN:-1000}"
 GEN_MAX_VAL="${GEN_MAX_VAL:-250}"
 GEN_MAX_TEST="${GEN_MAX_TEST:-500}"
 GEN_MAX_OOD="${GEN_MAX_OOD:-500}"
-# Quick-test head subset (full zoo runs in pipeline*.sh).
+# Quick-test head subset (full zoo runs in run_backbone.sh).
 HEAD_TYPES="${HEAD_TYPES:-spatialmind constraint_only spatialmind_neural uhead factoscope mlp}"
 
 source "${SCRIPT_DIR}/common.sh"
@@ -47,7 +47,7 @@ read -ra ALL_HEAD_TYPES <<< "${HEAD_TYPES}"
 OOD_DATASETS_CONFIG="${OOD_DATASETS:-spartqa babi SpaRTUN SpaceNLI}"
 OOD_DATASETS=(); read -r -a OOD_DATASETS <<< "${OOD_DATASETS_CONFIG}"
 
-RUN_LOG="${LOGS_ROOT}/example.log"; mkdir -p "${LOGS_ROOT}"
+RUN_LOG="${LOGS_ROOT}/smoke.log"; mkdir -p "${LOGS_ROOT}"
 exec > >(tee -a "${RUN_LOG}") 2>&1
 
 setup_environment
@@ -71,9 +71,9 @@ echo "Samples: train=${GEN_MAX_TRAIN} val=${GEN_MAX_VAL} test=${GEN_MAX_TEST} oo
 echo "OOD: ${OOD_DATASETS[*]:-none}"
 echo "Cache: ${CACHE_DIR}"
 
-source "${SCRIPT_DIR}/p1.sh"
-source "${SCRIPT_DIR}/p2.sh"
-source "${SCRIPT_DIR}/p3.sh"
+source "${SCRIPT_DIR}/phase_data.sh"
+source "${SCRIPT_DIR}/phase_train.sh"
+source "${SCRIPT_DIR}/phase_eval.sh"
 
 SKIP_DOWNLOAD="${SKIP_DOWNLOAD:-1}"
 [[ "${SKIP_DOWNLOAD}" != "1" ]] && { run_phase0 || echo "[WARN] downloads had failures"; }

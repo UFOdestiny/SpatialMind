@@ -11,4 +11,3 @@ from models.features import (
     TokenProbExtractor,
     AttentionExtractor,
 )
-from models.inference import CausalLMWithUncertainty

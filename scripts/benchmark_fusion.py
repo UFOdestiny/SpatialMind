@@ -1,9 +1,15 @@
 #!/usr/bin/env python3
-"""Compare fusion_v2 (multi-signal) vs old fusion vs best base, all backbones.
+"""Benchmark the SpatialMind fusion combiner across all backbones.
 
-Runs the multi-signal combiner for every (backbone, dataset), then prints a
-table of: best single base (test-oracle upper ref), old 2-signal fusion,
-new multi-signal fusion_v2, and whether v2 reaches SOTA (>= best base).
+For every (backbone, dataset) this:
+  1. runs the multi-signal combiner (scripts/fusion.py), writing fusion/*;
+  2. prints a table of the best single base signal (test-oracle upper reference),
+     the pairwise 2-signal baseline (fusion_pairwise/*, if present), the
+     multi-signal fusion, and whether fusion reaches SOTA (>= best base).
+
+The pairwise column is a reference only; it is populated by running
+scripts/fusion_pairwise.py first (or by the pipeline). Missing pairwise
+reports simply show 0.000.
 """
 import json, os, sys, subprocess
 import numpy as np
@@ -36,30 +42,31 @@ def base(R, tag, h):
 
 
 def main():
-    grand = {"v2_sota": 0, "old_sota": 0, "cells": 0}
+    grand = {"fusion_sota": 0, "pairwise_sota": 0, "cells": 0}
     for name, ns, sub, model in BB:
         R = f"spatialmind/results/{ns}"
-        # run multi_fusion (writes fusion_v2/*)
-        subprocess.run([sys.executable, "scripts/multi_fusion.py",
+        # run the multi-signal combiner (writes fusion/*)
+        subprocess.run([sys.executable, "scripts/fusion.py",
                         "--results_root", R, "--cache_subdir", sub, "--model", model],
                        capture_output=True)
         print(f"\n===== {name} =====")
-        print(f"{'dataset':12s}{'best_base':>10s}{'old_fus':>9s}{'v2_fus':>9s}  v2_SOTA")
-        v2s, olds = [], []
+        print(f"{'dataset':12s}{'best_base':>10s}{'pairwise':>10s}{'fusion':>9s}  SOTA")
+        fus, pair = [], []
         for tag, d in DS:
             bb = max([(base(R, tag, h) or -1, h) for h in ALLH])
-            old = au(f"{R}/fusion/{tag}/evaluation_report.json")
-            v2 = au(f"{R}/fusion_v2/{tag}/evaluation_report.json")
-            v2s.append(v2 if v2 else 0); olds.append(old if old else 0)
-            sota = "YES" if (v2 and v2 >= bb[0] - 0.003) else ""
+            p = au(f"{R}/fusion_pairwise/{tag}/evaluation_report.json")
+            f = au(f"{R}/fusion/{tag}/evaluation_report.json")
+            fus.append(f if f else 0); pair.append(p if p else 0)
+            sota = "YES" if (f and f >= bb[0] - 0.003) else ""
             grand["cells"] += 1
-            if v2 and v2 >= bb[0] - 0.003:
-                grand["v2_sota"] += 1
-            if old and old >= bb[0] - 0.003:
-                grand["old_sota"] += 1
-            print(f"{d:12s}{bb[0]:>10.3f}{(old or 0):>9.3f}{(v2 or 0):>9.3f}  {sota}  ({bb[1]})")
-        print(f"{'MEAN':12s}{'':>10s}{np.mean(olds):>9.3f}{np.mean(v2s):>9.3f}")
-    print(f"\n### v2 SOTA cells {grand['v2_sota']}/{grand['cells']}  |  old fusion SOTA {grand['old_sota']}/{grand['cells']}")
+            if f and f >= bb[0] - 0.003:
+                grand["fusion_sota"] += 1
+            if p and p >= bb[0] - 0.003:
+                grand["pairwise_sota"] += 1
+            print(f"{d:12s}{bb[0]:>10.3f}{(p or 0):>10.3f}{(f or 0):>9.3f}  {sota}  ({bb[1]})")
+        print(f"{'MEAN':12s}{'':>10s}{np.mean(pair):>10.3f}{np.mean(fus):>9.3f}")
+    print(f"\n### fusion SOTA cells {grand['fusion_sota']}/{grand['cells']}  "
+          f"|  pairwise SOTA {grand['pairwise_sota']}/{grand['cells']}")
 
 
 if __name__ == "__main__":

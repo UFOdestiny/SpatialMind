@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 ###############################################################################
-# p2.sh - Phase 2: train the head zoo on cached frozen features.
+# phase_train.sh - train the head zoo on cached frozen features.
 #
-# Sourced by pipelines (provides run_phase2), or run directly:
-#   sbatch jobs/p2.sh
-#   HEAD_TYPES="spatialmind uhead" bash jobs/p2.sh
+# Sourced by run scripts (provides run_phase2), or run directly:
+#   sbatch jobs/phase_train.sh
+#   HEAD_TYPES="spatialmind uhead" bash jobs/phase_train.sh
 ###############################################################################
 
-#SBATCH --job-name=sm-p2
+#SBATCH --job-name=sm-train
 #SBATCH --account=fsu-compsci-dept
 #SBATCH --qos=fsu-compsci-dept
 #SBATCH --nodes=1
@@ -107,7 +107,7 @@ if [[ ${_P2_SOURCED} -eq 0 ]]; then
     SCRIPT_DIR="/home/dy23a.fsu/popllm/SpatialMind/jobs"
     source "${SCRIPT_DIR}/common.sh"
     [[ -n "${HEAD_TYPES:-}" ]] && read -ra ALL_HEAD_TYPES <<< "${HEAD_TYPES}"
-    RUN_LOG="${LOGS_ROOT}/p2.log"; mkdir -p "${LOGS_ROOT}"
+    RUN_LOG="${LOGS_ROOT}/phase_train.log"; mkdir -p "${LOGS_ROOT}"
     exec > >(tee -a "${RUN_LOG}") 2>&1
     setup_environment; detect_gpus
     print_header "SpatialMind - Phase 2: Train Heads"

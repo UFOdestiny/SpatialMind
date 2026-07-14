@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""Multi-signal applicability-aware fusion (v2 combiner).
+"""SpatialMind multi-signal applicability-aware fusion (headline combiner).
 
-Extends scripts/gated_fusion.py from a fixed 2-signal (constraint + mlp) stacker
-to a stacker over an ARBITRARY set of base UQ signals plus determinacy gates.
+Stacks an ARBITRARY set of base UQ signals plus symbolizability/determinacy gates,
+generalizing the fixed 2-signal (constraint + mlp) stacker in fusion_pairwise.py.
 Rationale: per (backbone, dataset) the winning signal is often NOT one of the two
 fixed partners (e.g. constraint_only, spatialmind_neural, constraint_rule,
 token_entropy). Letting the combiner see all of them, with an L2 that is selected
 on a validation-internal split, lets it route to whichever signal is best while
 still gating by symbolizability/determinacy. No test labels/stats are ever used.
 
-Honest protocol (identical to gated_fusion):
+Honest protocol (identical to fusion_pairwise):
   * combiner + standardization fit on VALIDATION only;
   * (feature-set, L2) selected on a deterministic val-internal even/odd split;
   * refit on full val, applied once to test.
@@ -260,7 +260,7 @@ def main():
     ap.add_argument("--model", required=True)
     ap.add_argument("--datasets", default="id:StepGame,spartqa:spartqa,babi:babi,"
                     "SpaRTUN:SpaRTUN,SpaceNLI:SpaceNLI,SpartQA_YN:SpartQA_YN")
-    ap.add_argument("--out_subdir", default="fusion_v2")
+    ap.add_argument("--out_subdir", default="fusion")
     args = ap.parse_args()
     pairs = [tuple(x.split(":")) for x in args.datasets.split(",")]
     print(f"{'dataset':12s}{'fused':>8s}{'gate':>13s}{'l2':>5s}{'nSig':>5s}  best_base")
@@ -278,7 +278,7 @@ def main():
         od = f"{args.results_root}/{args.out_subdir}/{tag}"
         os.makedirs(od, exist_ok=True)
         m = compute_all_metrics(r["yt"], r["fused"])
-        json.dump({"method_type": "fusion_v2", "fusion_gate": r["gate"], "l2": r["l2"],
+        json.dump({"method_type": "fusion", "fusion_gate": r["gate"], "l2": r["l2"],
                    "n_signals": r["n_signals"], "signals": r["signals"],
                    "overall_metrics": m,
                    "predictions": [{"sample_id": int(r["ids"][i]), "trace_label": int(r["yt"][i]),

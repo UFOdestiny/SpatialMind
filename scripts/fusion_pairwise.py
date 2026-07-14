@@ -205,8 +205,8 @@ def fuse_one(results_root, cache_root, model, tag, cache_name,
     a_con = compute_all_metrics(yt, sct)["roc_auc"]
     a_neu = compute_all_metrics(yt, snt)["roc_auc"]
     report = {
-        "method_type": "fusion",
-        "head_type": f"gated_fusion[{con_head}+{neu_head}]",
+        "method_type": "fusion_pairwise",
+        "head_type": f"fusion_pairwise[{con_head}+{neu_head}]",
         "fusion_mode": mode,
         "l2": l2,
         "config_selected_on": "validation_internal_split",
@@ -241,7 +241,7 @@ def main():
     ap.add_argument("--l2", type=float, default=1.0)
     ap.add_argument("--datasets", default="id:StepGame,spartqa:spartqa,babi:babi,"
                                           "SpaRTUN:SpaRTUN,SpaceNLI:SpaceNLI")
-    ap.add_argument("--out_subdir", default="fusion")
+    ap.add_argument("--out_subdir", default="fusion_pairwise")
     args = ap.parse_args()
 
     pairs = [tuple(x.split(":")) for x in args.datasets.split(",")]
