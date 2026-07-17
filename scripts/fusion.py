@@ -100,6 +100,139 @@ def auroc(y, s):
     return compute_all_metrics(y, s)["roc_auc"] if len(np.unique(y)) > 1 else float("nan")
 
 
+def _clip(p):
+    return np.clip(p, 1e-6, 1 - 1e-6)
+
+
+def _logit(p):
+    p = _clip(p)
+    return np.log(p / (1 - p))
+
+
+# ----- post-hoc calibrators (fit on VALIDATION only, applied once to test) -----
+def _macro_brier(y, s):
+    """Class-balanced Brier == benchmark_fair.macro_brier (the reported metric).
+
+    On imbalanced splits (StepGame pos~0.24 etc.) this disagrees with the plain
+    Brier/NLL a temperature fit optimises, so we calibrate against it directly.
+    """
+    s = _clip(s)
+    y = np.asarray(y, dtype=np.float64)
+    pos = y == 1; neg = y == 0
+    if pos.sum() == 0 or neg.sum() == 0:
+        return float(np.mean((s - y) ** 2))
+    return float(0.5 * np.mean((s[pos] - 1) ** 2) + 0.5 * np.mean(s[neg] ** 2))
+
+
+def _fit_affine_macrobrier(p_val, y):
+    """Affine map in logit space p' = sigmoid(a*logit(p)+b), grid-searched to
+    minimise MACRO Brier. a>0 keeps it strictly monotone (AUROC unchanged); the
+    bias b fixes the class-imbalance prior shift a plain temperature can't touch.
+    Returned as a ("beta", a, b) tuple so _apply_calib handles it directly.
+    """
+    z = _logit(p_val); y = np.asarray(y, dtype=np.float64)
+    best, out = 1e18, (1.0, 0.0)
+    for a in np.linspace(0.2, 3.0, 29):
+        za = a * z
+        for b in np.linspace(-3.0, 3.0, 61):
+            q = _clip(1 / (1 + np.exp(-(za + b))))
+            mb = _macro_brier(y, q)
+            if mb < best:
+                best, out = mb, (a, b)
+    return ("beta", out[0], out[1])
+
+
+def _fit_temperature(p_val, y):
+    z = _logit(p_val)
+    best_T, best = 1.0, 1e18
+    for T in np.concatenate([np.linspace(0.3, 3.0, 55), np.linspace(3.0, 8.0, 20)]):
+        q = _clip(1 / (1 + np.exp(-z / T)))
+        nll = -np.mean(y * np.log(q) + (1 - y) * np.log(1 - q))
+        if nll < best:
+            best, best_T = nll, T
+    return ("temp", best_T)
+
+
+def _fit_beta(p_val, y):
+    z = _logit(p_val); a, b = 1.0, 0.0
+    for _ in range(2000):
+        q = _clip(1 / (1 + np.exp(-(a * z + b))))
+        a -= 0.3 * np.mean((q - y) * z); b -= 0.3 * np.mean(q - y)
+    return ("beta", a, b)
+
+
+def _fit_isotonic(p_val, y):
+    from sklearn.isotonic import IsotonicRegression
+    ir = IsotonicRegression(out_of_bounds="clip", y_min=0.0, y_max=1.0)
+    ir.fit(p_val, y)
+    return ("iso", ir)
+
+
+def _apply_calib(cal, p):
+    if cal is None or cal[0] == "identity":
+        return _clip(p)
+    if cal[0] == "temp":
+        return _clip(1 / (1 + np.exp(-_logit(p) / cal[1])))
+    if cal[0] == "beta":
+        return _clip(1 / (1 + np.exp(-(cal[1] * _logit(p) + cal[2]))))
+    if cal[0] == "iso":
+        return _clip(cal[1].predict(p))
+    return _clip(p)
+
+
+def select_calibrator(p_val, y_val):
+    """Pick a MACRO-Brier-optimal calibrator by k-fold val CV. All candidates are
+    monotone in p (affine/temp/beta/isotonic), so AUROC is preserved; only
+    calibration (macro-Brier/ECE) moves. Scored on the SAME class-balanced Brier
+    the paper benchmark reports, so the post-hoc map optimises the reported
+    metric instead of plain NLL (which mis-serves imbalanced splits). Leaves
+    identity only if no candidate beats it by >2% relative CV macro-Brier ->
+    avoids distorting an already-calibrated combiner on a small val split."""
+    n = len(y_val)
+    k = 5 if n >= 200 else 3
+    idx = np.arange(n)
+    folds = [idx[i::k] for i in range(k)]
+    makers = {"identity": lambda pv, yv: ("identity",),
+              "affine": _fit_affine_macrobrier,
+              "temp": _fit_temperature, "beta": _fit_beta}
+    if n >= 400:
+        makers["iso"] = _fit_isotonic
+    scores = {name: [] for name in makers}
+    for f in range(k):
+        te = folds[f]; tr = np.concatenate([folds[j] for j in range(k) if j != f])
+        if len(np.unique(y_val[tr])) < 2:
+            continue
+        for name, mk in makers.items():
+            try:
+                cal = mk(p_val[tr], y_val[tr])
+                q = _apply_calib(cal, p_val[te])
+                scores[name].append(_macro_brier(y_val[te], q))
+            except Exception:
+                scores[name].append(1e9)
+    means = {n_: (np.mean(v) if v else 1e9) for n_, v in scores.items()}
+    id_score = means.get("identity", 1e9)
+    best = min(means, key=means.get)
+    if best != "identity" and means[best] > id_score * 0.98:
+        best = "identity"
+    return makers[best](p_val, y_val), best
+
+
+def _kfold_cv_auroc(Sv, yv, tfv, gate, l2, k):
+    """Mean held-out AUROC over k val-internal folds for (gate, l2)."""
+    n = len(yv); idx = np.arange(n)
+    folds = [idx[i::k] for i in range(k)]
+    aus = []
+    for f in range(k):
+        te = folds[f]; tr = np.concatenate([folds[j] for j in range(k) if j != f])
+        if len(np.unique(yv[tr])) < 2 or len(np.unique(yv[te])) < 2:
+            continue
+        Xtr, _ = build_matrix({kk: v[tr] for kk, v in Sv.items()}, tfv[tr], gate)
+        fit = fit_logreg(Xtr, yv[tr], l2=l2)
+        Xte, _ = build_matrix({kk: v[te] for kk, v in Sv.items()}, tfv[te], gate)
+        aus.append(auroc(yv[te], apply_logreg(fit, Xte)))
+    return float(np.mean(aus)) if aus else float("nan")
+
+
 def collect_signals(R, tag, cname, split, sub):
     """Return dict signal_name -> (ids, labels, scores) aligned by sample_id."""
     if split == "test":
@@ -222,17 +355,15 @@ def fuse_one(R, cache_root, model, tag, cname, sub):
     Sv = {k: oriented[k][0] for k in oriented}
     St = {k: oriented[k][1] for k in oriented}
 
-    # select (gate, l2) on val-internal even/odd split
-    n = len(yv); fm = (np.arange(n) % 2 == 0)
+    # select (gate, l2) by k-fold val-internal CV (lower variance than a single
+    # even/odd split -> more stable routing on ~1000-sample val, tiny on babi).
+    n = len(yv)
+    kfold = 5 if n >= 200 else 3
     cands = []
     for gate, l2 in _GRID:
-        if len(np.unique(yv[fm])) < 2 or len(np.unique(yv[~fm])) < 2:
-            continue
-        Xf, names = build_matrix({k: v[fm] for k, v in Sv.items()}, tfv[fm], gate)
-        fit = fit_logreg(Xf, yv[fm], l2=l2)
-        Xs, _ = build_matrix({k: v[~fm] for k, v in Sv.items()}, tfv[~fm], gate)
-        a = auroc(yv[~fm], apply_logreg(fit, Xs))
-        cands.append((a, gate, l2))
+        a = _kfold_cv_auroc(Sv, yv, tfv, gate, l2, kfold)
+        if not np.isnan(a):
+            cands.append((a, gate, l2))
     if cands:
         top = max(c[0] for c in cands)
         # among near-tied configs, prefer larger L2 (anti-overfit)
@@ -243,9 +374,13 @@ def fuse_one(R, cache_root, model, tag, cname, sub):
     Xv, names = build_matrix(Sv, tfv, gate)
     Xt, _ = build_matrix(St, tft, gate)
     fit = fit_logreg(Xv, yv, l2=l2)
+    p_val = apply_logreg(fit, Xv)
     fused = apply_logreg(fit, Xt)
+    # Brier-aware post-hoc calibration: fit on validation, apply once to test.
+    cal, calname = select_calibrator(p_val, yv)
+    fused = _apply_calib(cal, fused)
     return {
-        "auroc": auroc(yt, fused), "gate": gate, "l2": l2,
+        "auroc": auroc(yt, fused), "gate": gate, "l2": l2, "calibrator": calname,
         "n_signals": len(oriented), "signals": sorted(oriented.keys()),
         "yt": yt, "fused": fused, "ids": idt,
         "base_test": base_test_all,
@@ -279,6 +414,7 @@ def main():
         os.makedirs(od, exist_ok=True)
         m = compute_all_metrics(r["yt"], r["fused"])
         json.dump({"method_type": "fusion", "fusion_gate": r["gate"], "l2": r["l2"],
+                   "calibrator": r.get("calibrator", "identity"),
                    "n_signals": r["n_signals"], "signals": r["signals"],
                    "overall_metrics": m,
                    "predictions": [{"sample_id": int(r["ids"][i]), "trace_label": int(r["yt"][i]),

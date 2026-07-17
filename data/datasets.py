@@ -21,6 +21,7 @@ from data.spartqa import SpartQADataset
 from data.spartqa_yn import SpartQAYNDataset
 from data.spartun import SpaRTUNDataset
 from data.spacenli import SpaceNLIDataset
+from data.sparp import SpaRPDataset
 from data.base import BaseTaskDataset
 
 DATASET_REGISTRY = {
@@ -35,6 +36,9 @@ DATASET_REGISTRY = {
     "SpaRTUN": SpaRTUNDataset,        # folder name alias
     "spacenli": SpaceNLIDataset,
     "SpaceNLI": SpaceNLIDataset,      # folder name alias
+    "sparp": SpaRPDataset,
+    "SpaRP_PS1": SpaRPDataset,        # folder name aliases
+    "SpaRP_PS3": SpaRPDataset,
 }
 
 
