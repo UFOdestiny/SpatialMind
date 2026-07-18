@@ -30,6 +30,11 @@ from scripts.fusion_pairwise import (  # noqa: E402
 R = "spatialmind/results/constraint_guided_v11_llama"
 CACHE = "spatialmind/cache/cached_features/constraint_guided_v11_llama"
 MODEL = "Llama-3.1-8B-Instruct"
+
+R = "spatialmind/results/constraint_guided_v11_mistral"
+CACHE = "spatialmind/cache/cached_features/constraint_guided_v11_mistral"
+MODEL = "Mistral-7B-Instruct-v0.3"
+
 CON = "constraint_no_conflict"
 NEU = "mlp"
 DATASETS = [("id", "StepGame"), ("spartqa", "spartqa"), ("babi", "babi"),

@@ -376,9 +376,20 @@ def fuse_one(R, cache_root, model, tag, cname, sub):
     fit = fit_logreg(Xv, yv, l2=l2)
     p_val = apply_logreg(fit, Xv)
     fused = apply_logreg(fit, Xt)
-    # Brier-aware post-hoc calibration: fit on validation, apply once to test.
-    cal, calname = select_calibrator(p_val, yv)
-    fused = _apply_calib(cal, fused)
+    # Post-hoc calibration: fit on validation, apply once to test. For a fair
+    # headline comparison (see the calibration-protocol study) every method --
+    # baselines, heads, and SpatialMind -- uses the SAME rank-preserving Platt
+    # map (Protocol A). Set FUSION_CALIB=darc to restore the macro-Brier-aware
+    # combiner-specific calibrator used in earlier drafts.
+    if os.environ.get("FUSION_CALIB", "platt").lower() == "darc":
+        cal, calname = select_calibrator(p_val, yv)
+        fused = _apply_calib(cal, fused)
+    else:
+        from models.calibration import StandardCalibrator
+        pc = StandardCalibrator().fit(np.clip(p_val, 1e-6, 1 - 1e-6), yv)
+        calname = "platt"
+        if pc.fitted:
+            fused = pc.transform(np.clip(fused, 1e-6, 1 - 1e-6))
     return {
         "auroc": auroc(yt, fused), "gate": gate, "l2": l2, "calibrator": calname,
         "n_signals": len(oriented), "signals": sorted(oriented.keys()),
