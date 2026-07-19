@@ -30,9 +30,8 @@ from scripts.metrics import compute_all_metrics  # noqa: E402
 from spatial_constraints.analysis import TRACE_FEATURE_NAMES  # noqa: E402
 
 PARSE = TRACE_FEATURE_NAMES.index("parse_rate")
-UNK = TRACE_FEATURE_NAMES.index("unknown_rate")
 ENT = TRACE_FEATURE_NAMES.index("entailment_rate")
-CUNK = TRACE_FEATURE_NAMES.index("conclusion_unknown")
+CON = TRACE_FEATURE_NAMES.index("contradiction_rate")
 
 SUP = ["constraint_no_conflict", "constraint_only", "spatialmind_neural",
        "spatialmind", "uhead", "factoscope", "mlp"]
@@ -157,7 +156,8 @@ def _fit_beta(p_val, y):
     z = _logit(p_val); a, b = 1.0, 0.0
     for _ in range(2000):
         q = _clip(1 / (1 + np.exp(-(a * z + b))))
-        a -= 0.3 * np.mean((q - y) * z); b -= 0.3 * np.mean(q - y)
+        a = max(1e-3, a - 0.3 * np.mean((q - y) * z))
+        b -= 0.3 * np.mean(q - y)
     return ("beta", a, b)
 
 
@@ -210,10 +210,7 @@ def select_calibrator(p_val, y_val):
             except Exception:
                 scores[name].append(1e9)
     means = {n_: (np.mean(v) if v else 1e9) for n_, v in scores.items()}
-    id_score = means.get("identity", 1e9)
     best = min(means, key=means.get)
-    if best != "identity" and means[best] > id_score * 0.98:
-        best = "identity"
     return makers[best](p_val, y_val), best
 
 
@@ -254,24 +251,26 @@ def collect_signals(R, tag, cname, split, sub):
 
 
 def build_matrix(sig_scores, tf, gate):
-    """sig_scores: dict name->score_vec (aligned). Returns design matrix X."""
+    """Build the three DARC designs from Eq. 8 of the paper.
+
+    The Determinacy Profile is applicability metadata, never an independent
+    reliability feature: it appears only in interactions with retained scores.
+    """
     names = sorted(sig_scores.keys())
     cols = [sig_scores[n] for n in names]
-    # pairwise products with the strongest-prior symbolic signal if present
     if gate in ("symb", "determinacy"):
-        pr = np.nan_to_num(tf[:, PARSE], nan=0.0)
-        cols.append(pr)
-        # gate each signal by parse rate (symbolizable -> trust symbolic-ish)
+        pi = np.nan_to_num(tf[:, PARSE], nan=0.0)
         for n in names:
-            cols.append(sig_scores[n] * pr)
+            cols.append(sig_scores[n] * pi)
     if gate == "determinacy":
-        unk = np.nan_to_num(tf[:, UNK], nan=1.0)
-        det = np.nan_to_num(tf[:, PARSE], nan=0.0) * (1.0 - unk)
-        cols.append(unk); cols.append(det)
-        cols.append(np.nan_to_num(tf[:, ENT], nan=0.0))
-        cols.append(np.nan_to_num(tf[:, CUNK], nan=1.0))
+        # d is the parsed-claim share with a definite (entailed or
+        # contradicted) status. It excludes semantic unknowns and claims that
+        # became non-evaluable after an earlier conflict.
+        pi = np.nan_to_num(tf[:, PARSE], nan=0.0)
+        d = np.nan_to_num(tf[:, ENT], nan=0.0) + np.nan_to_num(tf[:, CON], nan=0.0)
+        delta = pi * np.clip(d, 0.0, 1.0)
         for n in names:
-            cols.append(sig_scores[n] * det)
+            cols.append(sig_scores[n] * delta)
     return np.column_stack(cols), names
 
 
@@ -376,20 +375,10 @@ def fuse_one(R, cache_root, model, tag, cname, sub):
     fit = fit_logreg(Xv, yv, l2=l2)
     p_val = apply_logreg(fit, Xv)
     fused = apply_logreg(fit, Xt)
-    # Post-hoc calibration: fit on validation, apply once to test. For a fair
-    # headline comparison (see the calibration-protocol study) every method --
-    # baselines, heads, and SpatialMind -- uses the SAME rank-preserving Platt
-    # map (Protocol A). Set FUSION_CALIB=darc to restore the macro-Brier-aware
-    # combiner-specific calibrator used in earlier drafts.
-    if os.environ.get("FUSION_CALIB", "platt").lower() == "darc":
-        cal, calname = select_calibrator(p_val, yv)
-        fused = _apply_calib(cal, fused)
-    else:
-        from models.calibration import StandardCalibrator
-        pc = StandardCalibrator().fit(np.clip(p_val, 1e-6, 1 - 1e-6), yv)
-        calname = "platt"
-        if pc.fitted:
-            fused = pc.transform(np.clip(fused, 1e-6, 1 - 1e-6))
+    # Select a rank-preserving, macro-Brier-aware calibrator by validation CV,
+    # then fit once on all validation examples and apply once to test.
+    cal, calname = select_calibrator(p_val, yv)
+    fused = _apply_calib(cal, fused)
     return {
         "auroc": auroc(yt, fused), "gate": gate, "l2": l2, "calibrator": calname,
         "n_signals": len(oriented), "signals": sorted(oriented.keys()),

@@ -22,7 +22,7 @@ _PROJECT_ROOT="$(cd -- "${_SCRIPT_DIR}/.." && pwd)"
 # Optional, untracked machine/site configuration. This keeps local paths and
 # scheduler accounts out of the repository while making direct shell launches
 # behave the same as editor launches.
-_LOCAL_ENV="${_PROJECT_ROOT}/.env"
+_LOCAL_ENV="${_PROJECT_ROOT}/.vscode/.env"
 if [[ -f "${_LOCAL_ENV}" ]]; then
     set -a
     # shellcheck disable=SC1090
@@ -60,13 +60,13 @@ HF_TOKEN="${HF_TOKEN:-}"
 # Model & Dataset Configuration
 #
 # Backbones present on disk: Llama-3.1-8B-Instruct, Mistral-7B-Instruct-v0.3,
-# gemma-2-9b-it. Judge: Mistral-Small-3.2-24B-Instruct-2506.
+# gemma-2-9b-it, Qwen3-8B. Judge: Qwen3-1.7B.
 # vLLM backbone generation uses JSON-schema guided reasoning[] + conclusion.
 # Set CLAIM_EXTRACTOR_MODEL_NAME only to enable an additional guided extractor.
 ###############################################################################
 MODEL_NAME="${MODEL_NAME:-Llama-3.1-8B-Instruct}"
 DATASET_NAME="${DATASET_NAME:-StepGame}"
-JUDGE_MODEL_NAME="${JUDGE_MODEL_NAME:-Mistral-Small-3.2-24B-Instruct-2506}"
+JUDGE_MODEL_NAME="${JUDGE_MODEL_NAME:-Qwen3-1.7B}"
 CLAIM_EXTRACTOR_MODEL_NAME="${CLAIM_EXTRACTOR_MODEL_NAME:-}"
 CLAIM_EXTRACTOR_BACKEND="${CLAIM_EXTRACTOR_BACKEND:-vllm}"
 CLAIM_EXTRACTOR_MAX_NEW_TOKENS="${CLAIM_EXTRACTOR_MAX_NEW_TOKENS:-256}"
@@ -89,7 +89,7 @@ DOWNLOAD_MODELS=(
     "Llama-3.1-8B-Instruct:meta-llama/Llama-3.1-8B-Instruct"
     "Mistral-7B-Instruct-v0.3:mistralai/Mistral-7B-Instruct-v0.3"
     "gemma-2-9b-it:google/gemma-2-9b-it"
-    "Mistral-Small-3.2-24B-Instruct-2506:mistralai/Mistral-Small-3.2-24B-Instruct-2506"
+    "Qwen3-1.7B:Qwen/Qwen3-1.7B"
 )
 DOWNLOAD_DATASETS=(
     "StepGame:ZhengyanShi/StepGame"

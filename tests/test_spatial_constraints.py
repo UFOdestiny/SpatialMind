@@ -50,6 +50,20 @@ def test_first_invalid_claim_localization():
     assert analysis.claims[2].first_conflict
 
 
+def test_claims_after_a_conflict_are_not_evaluable():
+    analysis = analyze_trace(
+        "A is north of B.",
+        "Where is A relative to B?",
+        [
+            {"text": "A is south of B", "claim_type_id": 1},
+            {"text": "A is north of B", "claim_type_id": 1},
+        ],
+    )
+    assert analysis.claims[0].status == "contradicted"
+    assert analysis.claims[0].first_conflict
+    assert analysis.claims[1].status == "not_evaluable"
+
+
 def test_stepgame_label_conclusion_is_grounded_by_question():
     analysis = analyze_trace(
         "A is north of B. B is east of C.",

@@ -157,9 +157,16 @@ def analyze_trace(
         prefix = list(context_rel) + list(prior_rel)
         prefix_ok = feasible(prefix)
         with_claim_ok = feasible(prefix + parsed) if parsed else prefix_ok
-        statuses = [relation_status(prefix, r) for r in parsed]
-        status = _aggregate_status(statuses) if parsed else "unknown"
-        if predicted_nli_label and parsed:
+        # Once an earlier claim has made the prefix infeasible, the current
+        # claim has no independent semantic verdict.  Keep this distinct from
+        # ``unknown``: it reduces determinacy but is not evidence against the
+        # current claim (Method, Eq. 2).
+        if parsed and not prefix_ok:
+            status = "not_evaluable"
+        else:
+            statuses = [relation_status(prefix, r) for r in parsed]
+            status = _aggregate_status(statuses) if parsed else "unknown"
+        if predicted_nli_label and parsed and prefix_ok:
             expected = {
                 "entailment": "entailed", "contradiction": "contradicted", "neutral": "unknown"
             }[predicted_nli_label]
@@ -169,7 +176,7 @@ def analyze_trace(
         if first_conflict:
             first_conflict_seen = True
         repair = 0
-        if parsed and not with_claim_ok:
+        if parsed and status == "contradicted":
             repair = max(
                 minimum_repair_cost(context_rel, prior_rel, r, max_remove=3) for r in parsed
             )
@@ -204,6 +211,8 @@ def analyze_trace(
     parse_rate = len(parseable) / max(len(results), 1)
     contradiction_rate = sum(x.status == "contradicted" for x in parseable) / max(len(parseable), 1)
     entailment_rate = sum(x.status == "entailed" for x in parseable) / max(len(parseable), 1)
+    # Semantic unknowns exclude claims blocked by an infeasible prefix.  The
+    # latter are accounted for by determinacy as non-evaluable claims.
     unknown_rate = sum(x.status == "unknown" for x in parseable) / max(len(parseable), 1)
     first_pos = next((i / max(len(results) - 1, 1) for i, x in enumerate(results) if x.first_conflict), 1.0)
     repairs = [min(x.repair_cost, 4) / 4.0 for x in parseable]

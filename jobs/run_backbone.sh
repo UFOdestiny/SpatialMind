@@ -15,7 +15,7 @@ cd "${SCRIPT_DIR}/.."
 : "${RUN_TAG:?set RUN_TAG (short slug for the namespace, e.g. llama)}"
 
 export DATASET_NAME="StepGame"
-export JUDGE_MODEL_NAME="Mistral-Small-3.2-24B-Instruct-2506"
+export JUDGE_MODEL_NAME="Qwen3-1.7B"
 export CACHE_SUBDIR="constraint_guided_${RUN_TAG}"
 
 # --- scaled sample sizes (5k / 2k / 3k) ---
@@ -84,7 +84,7 @@ for ht in "${ALL_HEAD_TYPES[@]}"; do
     CUDA_VISIBLE_DEVICES=0 python scripts/train.py \
         --head_type "${ht}" --cache_dir "${ID_CACHE}" --output_dir "${out}" \
         --num_epochs "${TRAIN_EPOCHS}" --batch_size "${TRAIN_BATCH_SIZE}" \
-        --learning_rate "${TRAIN_LEARNING_RATE}" --loss_type bce --trace_loss_weight 0.5 \
+        --learning_rate "${TRAIN_LEARNING_RATE}" --loss_type balanced_bce --trace_loss_weight 0.5 \
         > "${LOGS_ROOT}/train/train_${ht}.log" 2>&1
     echo "[$( [[ $? -eq 0 ]] && echo OK || echo FAIL )] train ${ht}"
 done

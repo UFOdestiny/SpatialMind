@@ -277,7 +277,7 @@ class VLLMConfig:
 @dataclass
 class JudgeConfig:
     judge_model_path: str = field(
-        default_factory=lambda: f"{MODELS_ROOT}/{_get_env('JUDGE_MODEL_NAME', 'Mistral-Small-3.2-24B-Instruct-2506')}"
+        default_factory=lambda: f"{MODELS_ROOT}/{_get_env('JUDGE_MODEL_NAME', 'Qwen3-1.7B')}"
     )
     judge_backend: str = field(default_factory=lambda: _get_env("BACKEND", "vllm"))
     # Stage-2 reasoning verification uses an ANALYSIS-FIRST prompt (the judge writes

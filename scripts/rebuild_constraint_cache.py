@@ -81,6 +81,11 @@ def rebuild_split(cache_dir: Path, split: str):
             "contradiction_rate": counts["contradicted"] / max(counts["parseable"], 1),
             "entailment_rate": counts["entailed"] / max(counts["parseable"], 1),
             "unknown_rate": counts["unknown"] / max(counts["parseable"], 1),
+            "not_evaluable_rate": counts["not_evaluable"] / max(counts["parseable"], 1),
+            "determinacy_rate": (
+                (counts["entailed"] + counts["contradicted"])
+                / max(counts["parseable"], 1)
+            ),
             "first_conflict_rate": counts["first_conflicts"] / max(counts["samples"], 1),
             "context_coverage": counts["context_available"] / max(counts["samples"], 1),
             "source_infeasible_rate": counts["source_infeasible"] / max(counts["samples"], 1),
