@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=smind-qwen
-#SBATCH --account=fsu-compsci-dept
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
@@ -13,10 +12,10 @@
 # End-to-end reproduction for backbone = Qwen3-8B.
 # Full pipeline: data -> train head zoo -> ID/OOD eval -> val scores -> fusion
 #   -> sampling SOTA baselines -> fair benchmark. Datasets: StepGame(ID) +
-#   SpaRTQA, SpaRTUN, SpaceNLI, SpaRP (OOD). Namespace constraint_guided_v11_qwen.
+#   SpaRTQA, SpaRTUN, SpaceNLI, SpaRP (OOD).
 # Idempotent/resumable. Run:  sbatch jobs/reproduce_qwen.sh   (or bash ...)
 ###############################################################################
 set -uo pipefail
 export MODEL_NAME="Qwen3-8B"
 export RUN_TAG="qwen"
-bash /home/dy23a.fsu/popllm/SpatialMind/jobs/run_backbone_v11.sh
+bash "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/run_backbone.sh"

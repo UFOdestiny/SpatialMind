@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
-"""Final v11 benchmark: AUROC + class-balanced (macro) Brier SOTA-margin tables.
+"""Final benchmark: AUROC + class-balanced (macro) Brier SOTA-margin tables.
 
 For each (backbone, dataset) cell reports SpatialMind-fusion vs. the best
 per-metric competitor (neural probes + training-free baselines + constraint-rule),
 and the relative gain. Target: AUROC >=5% AND macroBrier >=5% (ideally >=10%).
 
 Usage:
-  python scripts/benchmark_v11.py                       # v11 namespace
-  python scripts/benchmark_v11.py --prefix constraint_guided_v10_ --fusion_subdir fusion_lab
+  python scripts/benchmark.py
 """
 from __future__ import annotations
 import argparse, json, os
@@ -78,7 +77,7 @@ def auroc(y, s):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--root", default="spatialmind/results")
-    ap.add_argument("--prefix", default="constraint_guided_v11_")
+    ap.add_argument("--prefix", default="constraint_guided_")
     ap.add_argument("--fusion_subdir", default="fusion")
     ap.add_argument("--tags", default="llama,mistral,gemma,qwen")
     args = ap.parse_args()

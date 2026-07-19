@@ -14,7 +14,7 @@ For sampling methods this means: their uncertainty score (computed from K
 temperature samples) is used to predict whether the GREEDY trace is correct.
 That is the standard, fair use of a sampling-based UQ score as a predictor.
 
-AUROC + class-balanced (macro) Brier, reported per (dataset) for the Llama v11
+AUROC + class-balanced (macro) Brier, reported per (dataset) for the Llama
 namespace. Datasets included are auto-detected from what exists on disk.
 """
 from __future__ import annotations
@@ -22,7 +22,7 @@ import argparse, json, os
 import numpy as np
 from sklearn.metrics import roc_auc_score
 
-R_DEFAULT = "spatialmind/results/constraint_guided_v11_llama"
+R_DEFAULT = "spatialmind/results/constraint_guided_llama"
 # fusion tag -> (eval dir)
 DATASETS = [("id", "StepGame", "eval"),
             ("spartqa", "SpaRTQA", "eval_ood/spartqa"),

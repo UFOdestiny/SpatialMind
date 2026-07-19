@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""DARC ablation table (Llama v11), AUROC / class-balanced macro-Brier.
+"""DARC ablation table (Llama), AUROC / class-balanced macro-Brier.
 
 Variants (all reuse scripts/fusion.py internals; validation-only fitting):
   * Constraint (pure)          -- the spatialmind constraint scorer alone
@@ -24,9 +24,9 @@ import scripts.fusion as F  # noqa: E402
 BACKBONE = os.environ.get("ABLATION_BACKBONE", "llama")
 _MODELS = {"llama": "Llama-3.1-8B-Instruct", "mistral": "Mistral-7B-Instruct-v0.3",
            "gemma": "Gemma-2-9B-it", "phi": "Phi-4-reasoning", "qwen": "Qwen3-8B"}
-R = f"spatialmind/results/constraint_guided_v11_{BACKBONE}"
+R = f"spatialmind/results/constraint_guided_{BACKBONE}"
 CACHE_ROOT = "spatialmind/cache/cached_features"
-SUB = f"constraint_guided_v11_{BACKBONE}"
+SUB = f"constraint_guided_{BACKBONE}"
 MODEL = _MODELS[BACKBONE]
 DATASETS = [("id", "StepGame", "StepGame"), ("spartqa", "SpaRTQA", "spartqa"),
             ("SpaRTUN", "SpaRTUN", "SpaRTUN"), ("SpaceNLI", "SpaceNLI", "SpaceNLI"),

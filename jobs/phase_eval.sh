@@ -13,8 +13,6 @@
 ###############################################################################
 
 #SBATCH --job-name=sm-eval
-#SBATCH --account=fsu-compsci-dept
-#SBATCH --qos=fsu-compsci-dept
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
@@ -153,7 +151,7 @@ run_phase3() {
 
 if [[ ${_P3_SOURCED} -eq 0 ]]; then
     set -euo pipefail
-    SCRIPT_DIR="/home/dy23a.fsu/popllm/SpatialMind/jobs"
+    SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
     source "${SCRIPT_DIR}/common.sh"
     [[ -n "${HEAD_TYPES:-}" ]] && read -ra ALL_HEAD_TYPES <<< "${HEAD_TYPES}"
     OOD_DATASETS=(); read -r -a OOD_DATASETS <<< "${OOD_DATASETS:-}"

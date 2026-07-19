@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Generate paper table numbers (AUROC / class-balanced macro-Brier) for every
 method, all backbones, 5 headline datasets (StepGame, SpaRTQA, SpaRTUN,
-SpaceNLI, SpaRP=SpaRP_PS3). Reads v11 namespaces. Pure post-processing.
+SpaceNLI, SpaRP=SpaRP_PS3). Reads submission namespaces. Pure post-processing.
 
 macro-Brier = 0.5*mean((s-1)^2 | y=1) + 0.5*mean(s^2 | y=0)  (class-balanced;
 plain Brier is base-rate-coupled on imbalanced OOD pools and is not reported).
@@ -15,7 +15,7 @@ import numpy as np
 from sklearn.metrics import roc_auc_score
 
 ROOT = "spatialmind/results"
-PREFIX = "constraint_guided_v11_"
+PREFIX = "constraint_guided_"
 BACKBONES = [("llama", "Llama-3.1-8B"), ("mistral", "Mistral-7B"),
              ("gemma", "Gemma-2-9B"), ("phi", "Phi-4-reasoning"),
              ("qwen", "Qwen3-8B")]

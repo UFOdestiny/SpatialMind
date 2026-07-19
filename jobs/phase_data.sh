@@ -8,8 +8,6 @@
 ###############################################################################
 
 #SBATCH --job-name=sm-data
-#SBATCH --account=fsu-compsci-dept
-#SBATCH --qos=fsu-compsci-dept
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=16
@@ -187,7 +185,7 @@ run_phase1() {
 ###############################################################################
 if [[ ${_P1_SOURCED} -eq 0 ]]; then
     set -euo pipefail
-    SCRIPT_DIR="/home/dy23a.fsu/popllm/SpatialMind/jobs"
+    SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
     source "${SCRIPT_DIR}/common.sh"
     OOD_DATASETS=(); read -r -a OOD_DATASETS <<< "${OOD_DATASETS:-}"
     RUN_LOG="${LOGS_ROOT}/phase_data.log"; mkdir -p "${LOGS_ROOT}"

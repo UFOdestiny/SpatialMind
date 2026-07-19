@@ -99,8 +99,8 @@ def sm_raw_scores(R, sub, model, tag, cname):
 
 
 def run_backbone(bb):
-    R = f"spatialmind/results/constraint_guided_v11_{bb}"
-    sub = f"constraint_guided_v11_{bb}"
+    R = f"spatialmind/results/constraint_guided_{bb}"
+    sub = f"constraint_guided_{bb}"
     model = MODELS[bb]
     out = {}
     for tag, disp, cname in DATASETS:
@@ -148,7 +148,7 @@ def main():
     winsA = winsB = cells = 0
     gapsA, gapsB = [], []
     for bb, disp in BBS:
-        if not os.path.isdir(f"spatialmind/results/constraint_guided_v11_{bb}"):
+        if not os.path.isdir(f"spatialmind/results/constraint_guided_{bb}"):
             continue
         r = run_backbone(bb)
         allout[bb] = r

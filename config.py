@@ -9,7 +9,7 @@ features, and aggregates the claim scores into a single trace-level (sample-leve
 reliability score used for the final evaluation.
 
 All tunable parameters live here. Every path can be overridden via environment
-variables so the project is portable across machines by editing only jobs/common.sh
+variables so the project is portable across machines without source edits.
 (shell) or the env vars below (python).
 """
 
@@ -57,7 +57,7 @@ def _get_env_bool(key: str, default: bool) -> bool:
 # Base paths (override via environment variables)
 #
 # Default runtime root is <repo>/spatialmind, which in this deployment is a
-# symlink to fast /blue scratch storage. jobs/common.sh sets these explicitly.
+# symlink to fast scratch storage. Job scripts set these explicitly when needed.
 # =============================================================================
 PROJECT_DIR = _get_env("PROJECT_DIR", str(Path(__file__).parent))
 WORKSPACE_ROOT = _get_env("SPATIALMIND_ROOT", f"{PROJECT_DIR}/spatialmind")

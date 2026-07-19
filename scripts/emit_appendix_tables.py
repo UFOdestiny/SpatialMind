@@ -30,7 +30,7 @@ def wrap_resizebox(lines):
 
 
 def load(bb, name):
-    p = f"spatialmind/results/constraint_guided_v11_{bb}/fusion/{name}.json"
+    p = f"spatialmind/results/constraint_guided_{bb}/fusion/{name}.json"
     return json.load(open(p))
 
 

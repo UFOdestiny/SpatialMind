@@ -11,7 +11,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-SRC = "spatialmind/results/constraint_guided_v11_llama/fusion/determinacy_trace.json"
+SRC = "spatialmind/results/constraint_guided_llama/fusion/determinacy_trace.json"
 OUT = "latex/fig"
 INK = "#1b2a4a"
 DET = "#2f6db3"

@@ -64,8 +64,7 @@ SpatialMind/
 │   └── wrapper.py            # multi-task training/inference wrapper + loss
 ├── scripts/                  # generate | judge | train | evaluate | fusion | diagnostics
 │   ├── fusion.py             # headline multi-signal applicability-aware combiner
-│   ├── fusion_pairwise.py    # 2-signal (constraint + mlp) combiner (reference)
-│   ├── benchmark_fusion.py   # cross-backbone fusion comparison table
+│   ├── benchmark.py          # cross-backbone benchmark table
 │   ├── constraint_diagnostics.py     # coverage + deterministic structural baseline
 │   └── constraint_counterfactual.py  # paired relation-intervention audit
 ├── utils/                    # collation, results tables, downloads, efficiency, ...
@@ -86,7 +85,7 @@ data    generate  vLLM JSON-schema guided decoding -> reasoning[] + conclusion; 
         rebuild   native constraint view recomputed from deployment-visible inputs
         audit     fail-closed leakage audit + coverage + counterfactual diagnostics
 train             train each head on cached features; best epoch by validation AUROC
-eval              sample-level metrics on ID (StepGame) + 5 OOD sets, heads + baselines
+eval              sample-level metrics on ID (StepGame) + 4 OOD sets, heads + baselines
 val               validation-split predictions for every fusion signal
 fusion            multi-signal applicability-aware combiner (validation-selected)
 ```
@@ -105,13 +104,12 @@ not zero-shot**; no target training examples update the StepGame-trained scorer.
 | --- | --- | --- |
 | **StepGame** | in-distribution | 9-way directional classification |
 | **SpaRTQA** | validation-adapted OOD | 4-way multiple choice |
-| **bAbI** | validation-adapted OOD | free-form QA |
 | **SpaRTUN** | validation-adapted OOD | spatial NLI/QA |
 | **SpaceNLI** | validation-adapted OOD | 3-way NLI |
-| **SpartQA-YN** | validation-adapted OOD | block-world yes/no/DK |
+| **SpaRP-PS3** | validation-adapted OOD | spatial-reasoning probe |
 
 Backbones (frozen, white-box): **Llama-3.1-8B-Instruct** (primary),
-**Mistral-7B-Instruct-v0.3**, **gemma-2-9b-it**, **Phi-4-reasoning**.
+**Mistral-7B-Instruct-v0.3**, **gemma-2-9b-it**, **Qwen3-8B**.
 Judge: **Mistral-Small-3.2-24B-Instruct-2506**. A StepGame-trained head is transferred to
 the five OOD sets without fine-tuning.
 
@@ -145,6 +143,10 @@ All runtime artifacts are written under `<repo>/spatialmind/` (a symlink to fast
 Override any path via environment variables; `jobs/common.sh` sets and exports them so
 `config.py` resolves identically.
 
+For a cluster-specific path or Slurm account, copy `.env.example` to
+`.vscode/.env` and fill in local values. The file is ignored by Git and loaded by the
+job scripts when present.
+
 | Variable | Purpose | Default |
 | --- | --- | --- |
 | `SPATIALMIND_ROOT` | runtime root for all artifacts | `<repo>/spatialmind` |
@@ -165,10 +167,10 @@ resumable). Each backbone writes to its own isolated namespace.
 bash jobs/smoke.sh                # or: sbatch jobs/smoke.sh
 
 # Full per-backbone pipeline (data -> train zoo -> eval ID+OOD -> val -> fusion)
-bash jobs/run_llama.sh            # Llama-3.1-8B  (primary)
-bash jobs/run_mistral.sh          # Mistral-7B-Instruct-v0.3
-bash jobs/run_gemma.sh            # gemma-2-9b-it
-bash jobs/run_phi4.sh             # Phi-4-reasoning
+MODEL_NAME=Llama-3.1-8B-Instruct RUN_TAG=llama bash jobs/run_backbone.sh
+MODEL_NAME=Mistral-7B-Instruct-v0.3 RUN_TAG=mistral bash jobs/run_backbone.sh
+MODEL_NAME=gemma-2-9b-it RUN_TAG=gemma bash jobs/run_backbone.sh
+MODEL_NAME=Qwen3-8B RUN_TAG=qwen bash jobs/run_backbone.sh
 
 # All backbones sequentially (single GPU; one finishes before the next starts)
 bash jobs/run_all.sh
@@ -179,7 +181,7 @@ HEAD_TYPES="spatialmind uhead" bash jobs/phase_train.sh   # train a subset
 bash jobs/phase_eval.sh                          # evaluate ID + OOD
 ```
 
-First run only: `SKIP_DOWNLOAD=0 bash jobs/run_llama.sh` to fetch models/datasets.
+First run only: prepend `SKIP_DOWNLOAD=0` to the selected `run_backbone.sh` command to fetch models/datasets.
 
 ### Fusion only (offline, from saved predictions)
 
@@ -189,13 +191,13 @@ combiner is pure post-processing (no GPU):
 ```bash
 # Single backbone
 python scripts/fusion.py \
-    --results_root spatialmind/results/constraint_guided_v10_20260712 \
-    --cache_subdir constraint_guided_v10 \
+    --results_root spatialmind/results/constraint_guided_llama \
+    --cache_subdir constraint_guided_llama \
     --model Llama-3.1-8B-Instruct \
-    --datasets "id:StepGame,spartqa:spartqa,babi:babi,SpaRTUN:SpaRTUN,SpaceNLI:SpaceNLI,SpartQA_YN:SpartQA_YN"
+    --datasets "id:StepGame,spartqa:spartqa,SpaRTUN:SpaRTUN,SpaceNLI:SpaceNLI,SpaRP_PS3:SpaRP_PS3"
 
 # All backbones + SOTA table
-python scripts/benchmark_fusion.py
+python scripts/benchmark.py
 ```
 
 ### Direct script usage

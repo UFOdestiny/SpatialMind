@@ -70,7 +70,7 @@ def auroc(y, s):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--root", default="spatialmind/results")
-    ap.add_argument("--prefix", default="constraint_guided_v10_")
+    ap.add_argument("--prefix", default="constraint_guided_")
     ap.add_argument("--fusion_subdir", default="fusion")
     args = ap.parse_args()
     fails = []

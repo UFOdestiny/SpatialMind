@@ -2,14 +2,14 @@
 """SpatialMind multi-signal applicability-aware fusion (headline combiner).
 
 Stacks an ARBITRARY set of base UQ signals plus symbolizability/determinacy gates,
-generalizing the fixed 2-signal (constraint + mlp) stacker in fusion_pairwise.py.
-Rationale: per (backbone, dataset) the winning signal is often NOT one of the two
-fixed partners (e.g. constraint_only, spatialmind_neural, constraint_rule,
+generalizing fixed two-signal stacking to all available signals. Rationale: per
+(backbone, dataset) the winning signal is often NOT one of the two fixed partners
+(e.g. constraint_only, spatialmind_neural, constraint_rule,
 token_entropy). Letting the combiner see all of them, with an L2 that is selected
 on a validation-internal split, lets it route to whichever signal is best while
 still gating by symbolizability/determinacy. No test labels/stats are ever used.
 
-Honest protocol (identical to fusion_pairwise):
+Honest protocol:
   * combiner + standardization fit on VALIDATION only;
   * (feature-set, L2) selected on a deterministic val-internal even/odd split;
   * refit on full val, applied once to test.

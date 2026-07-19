@@ -30,8 +30,8 @@ BACKBONE = os.environ.get("AUDIT_BACKBONE", "llama")
 _MODELS = {"llama": "Llama-3.1-8B-Instruct", "mistral": "Mistral-7B-Instruct-v0.3",
            "gemma": "gemma-2-9b-it", "phi": "Phi-4-reasoning", "qwen": "Qwen3-8B"}
 MODEL = _MODELS[BACKBONE]
-SUB = f"constraint_guided_v11_{BACKBONE}"
-R = f"spatialmind/results/constraint_guided_v11_{BACKBONE}"
+SUB = f"constraint_guided_{BACKBONE}"
+R = f"spatialmind/results/constraint_guided_{BACKBONE}"
 CACHE_ROOT = f"spatialmind/cache/cached_features/{SUB}"
 # (cache_folder, display)
 DATASETS = [("StepGame", "StepGame"), ("spartqa", "SpaRTQA"), ("SpaRTUN", "SpaRTUN"),

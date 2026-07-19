@@ -54,8 +54,8 @@ def metrics_both(sv, yv, st, yt):
 
 
 def collect(bb):
-    R = f"spatialmind/results/constraint_guided_v11_{bb}"
-    sub = f"constraint_guided_v11_{bb}"
+    R = f"spatialmind/results/constraint_guided_{bb}"
+    sub = f"constraint_guided_{bb}"
     model = MODELS[bb]
     cache_p = f"/tmp/sm_raw_{bb}.json"
     sm_cache = json.load(open(cache_p)) if os.path.exists(cache_p) else {}
@@ -134,7 +134,7 @@ def summarize(allout):
 def main():
     allout = {}
     for bb, disp in BBS:
-        if os.path.isdir(f"spatialmind/results/constraint_guided_v11_{bb}"):
+        if os.path.isdir(f"spatialmind/results/constraint_guided_{bb}"):
             allout[bb] = collect(bb)
             print(f"[{bb} done]", flush=True)
     json.dump(allout, open("/tmp/metric_protocol.json", "w"), indent=2)

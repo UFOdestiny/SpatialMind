@@ -23,7 +23,7 @@ sample_id used everywhere else, since get_dataset uses a fixed GLOBAL_SEED):
       mass on the "True" token as the confidence.
 
 Output matches baselines/combined_evaluation.json so it drops straight into
-benchmark_v11.py and the LaTeX tables. Honest protocol: Platt calibration is fit
+benchmark.py and the LaTeX tables. Honest protocol: Platt calibration is fit
 on the validation split and applied to test, identical to the other baselines.
 """
 from __future__ import annotations

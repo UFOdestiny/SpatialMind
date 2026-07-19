@@ -1,50 +1,29 @@
 #!/usr/bin/env bash
 ###############################################################################
-# run_backbone.sh - full SpatialMind pipeline for an ARBITRARY backbone.
+# run_backbone.sh - full submission pipeline for one backbone.
 #
-# End-to-end, submission-standard run. Reuses the real phase functions
-# (phase_data.sh generation/judge/rebuild/audit, phase_eval.sh eval) so behaviour
-# matches the phase scripts exactly. The backbone, cache namespace, results root
-# and logs root are all parameterized so multiple backbones can be run WITHOUT
-# overwriting each other's artifacts.
-#
-# Usage (do not run directly; use the per-model wrappers run_<model>.sh):
-#   MODEL_NAME=Mistral-7B-Instruct-v0.3 RUN_TAG=mistral bash jobs/run_backbone.sh
+# Results are namespaced by RUN_TAG and every stage is resumable.
+# The headline datasets are StepGame (ID), SpaRTQA, SpaRTUN, SpaceNLI, and SpaRP.
 #
 # Required env in:  MODEL_NAME, RUN_TAG
-#
-# Scale (same for every backbone):
-#   ID  StepGame : train 5000 / val 1000 / test 2000
-#   OOD (5 sets) : val 1000 / test 2000  (auto-capped to availability, e.g. babi)
-#
-# Stages (each idempotent / skippable):
-#   1  data   : generate -> judge -> rebuild constraints -> leakage audit (ID)
-#   2  train  : train the head zoo
-#   3  eval   : ID test eval (heads + baselines)
-#   4  ood    : OOD gen+judge+rebuild+eval (heads + baselines) x5
-#   5  val    : validation-split predictions for ALL fusion signals
-#   6  fusion : multi-signal applicability-aware fusion (validation-selected)
 ###############################################################################
 set -uo pipefail
-SCRIPT_DIR="/home/dy23a.fsu/popllm/SpatialMind/jobs"
-cd /home/dy23a.fsu/popllm/SpatialMind
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+cd "${SCRIPT_DIR}/.."
 
 : "${MODEL_NAME:?set MODEL_NAME (a dir under spatialmind/models)}"
-: "${RUN_TAG:?set RUN_TAG (short slug for the namespace, e.g. mistral)}"
+: "${RUN_TAG:?set RUN_TAG (short slug for the namespace, e.g. llama)}"
 
-# --- namespace: keyed by RUN_TAG so backbones never collide ---
 export DATASET_NAME="StepGame"
 export JUDGE_MODEL_NAME="Mistral-Small-3.2-24B-Instruct-2506"
-export CACHE_SUBDIR="constraint_guided_v10_${RUN_TAG}"
-export RESULTS_ROOT="/home/dy23a.fsu/popllm/SpatialMind/spatialmind/results/constraint_guided_v10_${RUN_TAG}"
-export LOGS_ROOT="/home/dy23a.fsu/popllm/SpatialMind/spatialmind/logs/constraint_guided_v10_${RUN_TAG}"
+export CACHE_SUBDIR="constraint_guided_${RUN_TAG}"
 
-# --- scaled sample sizes ---
+# --- scaled sample sizes (5k / 2k / 3k) ---
 export GEN_MAX_TRAIN="${GEN_MAX_TRAIN:-5000}"
-export GEN_MAX_VAL="${GEN_MAX_VAL:-1000}"
-export GEN_MAX_TEST="${GEN_MAX_TEST:-2000}"
-export GEN_MAX_OOD="${GEN_MAX_OOD:-2000}"
-export GEN_MAX_OOD_VAL="${GEN_MAX_OOD_VAL:-1000}"
+export GEN_MAX_VAL="${GEN_MAX_VAL:-2000}"
+export GEN_MAX_TEST="${GEN_MAX_TEST:-3000}"
+export GEN_MAX_OOD="${GEN_MAX_OOD:-3000}"
+export GEN_MAX_OOD_VAL="${GEN_MAX_OOD_VAL:-2000}"
 
 export CALIBRATE="${CALIBRATE:-standard}"
 export STRUCT_CALIB_C="${STRUCT_CALIB_C:-0.01}"
@@ -52,16 +31,19 @@ export TRAIN_EPOCHS="${TRAIN_EPOCHS:-30}"
 export TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-256}"
 export TRAIN_LEARNING_RATE="${TRAIN_LEARNING_RATE:-0.0002}"
 
-# Head zoo trained on the ID cache. The fusion combiner draws on the supervised
-# heads plus the unsupervised baselines below.
+# Head zoo trained on the ID cache.
 HEAD_TYPES="spatialmind constraint_only spatialmind_neural constraint_no_conflict constraint_no_context constraint_no_entailment constraint_no_repair uhead factoscope mlp"
-OOD_LIST=(spartqa babi SpaRTUN SpaceNLI SpartQA_YN)
-# Supervised heads scored on validation (must be a subset of HEAD_TYPES).
+# Final headline lineup: StepGame(ID) + SpaRTQA, SpaRTUN, SpaceNLI, SpaRP (OOD).
+# bAbI and SpartQA-YN dropped (single-pass information ceiling / near-chance).
+OOD_LIST=(spartqa SpaRTUN SpaceNLI SpaRP_PS3)
 FUSION_SUP_HEADS="constraint_no_conflict constraint_only spatialmind_neural spatialmind uhead factoscope mlp"
-# Unsupervised baselines scored on validation for fusion.
 FUSION_BASELINES="constraint_rule,ccp,mcp,perplexity,token_entropy,random"
+# Sampling-based SOTA baselines (K stochastic decodes each), run after the heads.
+SAMPLING_K="${SAMPLING_K:-10}"
 
 source "${SCRIPT_DIR}/common.sh"
+export RESULTS_ROOT="${RESULTS_ROOT:-${BASE_RESULTS_ROOT}/${CACHE_SUBDIR}}"
+export LOGS_ROOT="${LOGS_ROOT:-${BASE_LOGS_ROOT}/${CACHE_SUBDIR}}"
 read -ra ALL_HEAD_TYPES <<< "${HEAD_TYPES}"
 setup_environment
 detect_gpus
@@ -84,22 +66,15 @@ mkdir -p "${LOGS_ROOT}/data" "${LOGS_ROOT}/train" "${LOGS_ROOT}/eval" "${RESULTS
 echo "########################################################"
 echo "### run_backbone start $(date)"
 echo "### backbone : ${MODEL_NAME}"
-echo "### tag      : ${RUN_TAG}"
+echo "### tag      : ${RUN_TAG}   namespace: ${CACHE_SUBDIR}"
 echo "### cache    : ${ID_CACHE}"
-echo "### results  : ${RESULTS_ROOT}"
 echo "### sizes: train=${GEN_MAX_TRAIN} val=${GEN_MAX_VAL} test=${GEN_MAX_TEST} ood=${GEN_MAX_OOD}/${GEN_MAX_OOD_VAL}"
 echo "########################################################"
 
-###############################################################################
-# Stage 1: data phase (ID)
-###############################################################################
 echo "===== STAGE 1: data (ID) $(date) ====="
 run_phase1 "train,validation,test" "${GEN_MAX_TRAIN},${GEN_MAX_VAL},${GEN_MAX_TEST}" \
     || { echo "[FATAL] data phase failed"; exit 1; }
 
-###############################################################################
-# Stage 2: train head zoo
-###############################################################################
 echo "===== STAGE 2: train heads $(date) ====="
 for ht in "${ALL_HEAD_TYPES[@]}"; do
     out="${RESULTS_ROOT}/train/${ht}"
@@ -114,9 +89,6 @@ for ht in "${ALL_HEAD_TYPES[@]}"; do
     echo "[$( [[ $? -eq 0 ]] && echo OK || echo FAIL )] train ${ht}"
 done
 
-###############################################################################
-# Stage 3: ID test eval + baselines
-###############################################################################
 echo "===== STAGE 3: ID eval $(date) ====="
 for ht in "${ALL_HEAD_TYPES[@]}"; do
     out="${RESULTS_ROOT}/eval/${ht}"
@@ -126,9 +98,6 @@ done
 [[ -f "${RESULTS_ROOT}/eval/baselines/combined_evaluation.json" ]] || \
     eval_baselines "${ID_CACHE}" "${RESULTS_ROOT}/eval/baselines" || echo "[FAIL] ID baselines"
 
-###############################################################################
-# Stage 4: OOD gen+judge+rebuild+eval
-###############################################################################
 echo "===== STAGE 4: OOD $(date) ====="
 for ood in "${OOD_LIST[@]}"; do
     echo "---------- OOD ${ood} $(date) ----------"
@@ -150,20 +119,12 @@ for ood in "${OOD_LIST[@]}"; do
         eval_baselines "${ood_cache}" "${RESULTS_ROOT}/eval_ood/${ood}/baselines" || echo "[FAIL] baselines ${ood}"
 done
 
-###############################################################################
-# Stage 5: validation-split predictions for ALL fusion signals
-#
-# The multi-signal fusion combiner is fit on validation only, so every signal it
-# may route to needs a validation-split prediction. Supervised heads -> per-head
-# reports; unsupervised baselines -> a combined report. Test is never touched.
-###############################################################################
 echo "===== STAGE 5: val_scores for fusion $(date) ====="
-declare -A CN=( [StepGame]=StepGame [spartqa]=spartqa [babi]=babi [SpaRTUN]=SpaRTUN [SpaceNLI]=SpaceNLI [SpartQA_YN]=SpartQA_YN )
+declare -A CN=( [StepGame]=StepGame [spartqa]=spartqa [babi]=babi [SpaRTUN]=SpaRTUN [SpaceNLI]=SpaceNLI )
 for ds in StepGame "${OOD_LIST[@]}"; do
     if [[ "${ds}" == "StepGame" ]]; then cache="${ID_CACHE}"; else cache="$(_ood_cache_dir "${ds}")"; fi
     [[ -d "${cache}/validation" ]] || { echo "[skip] ${ds}: no val cache"; continue; }
-    dname="${CN[$ds]}"
-    # supervised heads
+    dname="${CN[$ds]:-$ds}"
     for ht in ${FUSION_SUP_HEADS}; do
         hp="${RESULTS_ROOT}/train/${ht}/final_model"
         [[ -f "${hp}/head_weights.pth" ]] || { echo "[skip] ${ht} not trained"; continue; }
@@ -177,7 +138,6 @@ for ds in StepGame "${OOD_LIST[@]}"; do
             > "${LOGS_ROOT}/eval/val_${ds}_${ht}.log" 2>&1
         echo "[$( [[ $? -eq 0 ]] && echo OK || echo FAIL )] val ${ds}/${ht}"
     done
-    # unsupervised baselines
     bout="${RESULTS_ROOT}/val_scores_baselines/${dname}"
     if [[ ! -f "${bout}/combined_evaluation.json" ]]; then
         mkdir -p "${bout}"
@@ -190,17 +150,44 @@ for ds in StepGame "${OOD_LIST[@]}"; do
     fi
 done
 
-###############################################################################
-# Stage 6: multi-signal fusion (validation-selected, no test peeking)
-###############################################################################
 echo "===== STAGE 6: fusion $(date) ====="
 python scripts/fusion.py \
     --results_root "${RESULTS_ROOT}" \
-    --cache_root "${CACHE_ROOT}/cached_features/${CACHE_SUBDIR}" \
+    --cache_root "${CACHE_ROOT}/cached_features" \
+    --cache_subdir "${CACHE_SUBDIR}" \
     --model "${MODEL_NAME}" \
     --out_subdir fusion \
-    --datasets "id:StepGame,spartqa:spartqa,babi:babi,SpaRTUN:SpaRTUN,SpaceNLI:SpaceNLI,SpartQA_YN:SpartQA_YN" \
+    --datasets "id:StepGame,spartqa:spartqa,SpaRTUN:SpaRTUN,SpaceNLI:SpaceNLI,SpaRP_PS3:SpaRP_PS3" \
     2>&1 | tee "${LOGS_ROOT}/eval/fusion.log"
+
+###############################################################################
+# Stage 7: sampling-based SOTA baselines (Semantic Entropy / SelfCheckGPT /
+# P(True)). K stochastic decodes per sample; written to baselines_sampling/ so
+# they never clobber the single-pass baselines. Scored against the same greedy
+# trace label at benchmark time (scripts/benchmark_fair.py).
+###############################################################################
+echo "===== STAGE 7: sampling baselines $(date) ====="
+export VLLM_WORKER_MULTIPROC_METHOD=spawn
+declare -A SAMP_DIR=( [StepGame]="eval" [spartqa]="eval_ood/spartqa" \
+                      [babi]="eval_ood/babi" \
+                      [SpaRTUN]="eval_ood/SpaRTUN" [SpaceNLI]="eval_ood/SpaceNLI" \
+                      [SpaRP_PS1]="eval_ood/SpaRP_PS1" [SpaRP_PS3]="eval_ood/SpaRP_PS3" )
+declare -A SAMP_DS=( [StepGame]="StepGame" [spartqa]="spartqa" [babi]="babi" \
+                     [SpaRTUN]="SpaRTUN" [SpaceNLI]="SpaceNLI" \
+                     [SpaRP_PS1]="SpaRP_PS1" [SpaRP_PS3]="SpaRP_PS3" )
+for key in StepGame spartqa babi SpaRTUN SpaceNLI SpaRP_PS1 SpaRP_PS3; do
+    out="${RESULTS_ROOT}/${SAMP_DIR[$key]}/baselines_sampling"
+    [[ -f "${out}/combined_evaluation.json" ]] && { echo "[SKIP] sampling ${key}"; continue; }
+    python scripts/sampling_baselines.py \
+        --model_path "${MODEL_PATH}" --dataset_name "${SAMP_DS[$key]}" \
+        --dataset_path "${DATASETS_ROOT}/${SAMP_DS[$key]}/hf_dataset" \
+        --out_dir "${out}" --max_val "${GEN_MAX_VAL}" --max_test "${GEN_MAX_TEST}" \
+        --K "${SAMPLING_K}" --temp 0.7 --gpu_frac 0.85 --max_len "${VLLM_MAX_MODEL_LEN:-2048}" \
+        > "${LOGS_ROOT}/eval/sampling_${key}.log" 2>&1 || echo "[FAIL] sampling ${key}"
+done
+
+echo "===== FINAL benchmark (fair, unified labels) $(date) ====="
+python scripts/benchmark_fair.py --root "${RESULTS_ROOT}" 2>&1 | tee "${LOGS_ROOT}/eval/benchmark_fair.log"
 
 echo "########################################################"
 echo "### run_backbone (${RUN_TAG}) done $(date)"

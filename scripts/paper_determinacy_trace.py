@@ -22,7 +22,7 @@ which is positive when the constraint score points the correct way and larger
 when the trace is more determinate iff determinacy drives constraint reliability.
 This is the standard within-group point-biserial decomposition.
 
-Pure post-processing; reads Llama v11 signals (matches the figure source).
+Pure post-processing; reads Llama signals (matches the figure source).
 Writes spatialmind/results/<ns>/fusion/determinacy_trace.json.
 """
 from __future__ import annotations
@@ -34,8 +34,8 @@ import scripts.fusion as F  # noqa: E402
 BACKBONE = os.environ.get("DET_BACKBONE", "llama")
 _MODELS = {"llama": "Llama-3.1-8B-Instruct", "mistral": "Mistral-7B-Instruct-v0.3",
            "gemma": "gemma-2-9b-it", "phi": "Phi-4-reasoning", "qwen": "Qwen3-8B"}
-R = f"spatialmind/results/constraint_guided_v11_{BACKBONE}"
-SUB = f"constraint_guided_v11_{BACKBONE}"
+R = f"spatialmind/results/constraint_guided_{BACKBONE}"
+SUB = f"constraint_guided_{BACKBONE}"
 MODEL = _MODELS[BACKBONE]
 CACHE_ROOT = "spatialmind/cache/cached_features"
 CON = "constraint_no_conflict"

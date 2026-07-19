@@ -98,8 +98,8 @@ def paired_bootstrap(yt, s_a, s_b):
 
 
 def run_backbone(bb):
-    R = f"spatialmind/results/constraint_guided_v11_{bb}"
-    sub = f"constraint_guided_v11_{bb}"
+    R = f"spatialmind/results/constraint_guided_{bb}"
+    sub = f"constraint_guided_{bb}"
     model = _MODELS[bb]
     out = {"backbone": bb, "datasets": {}}
     for tag, disp, cname in DATASETS:
@@ -157,7 +157,7 @@ def run_backbone(bb):
 def main():
     allres = {}
     for bb in BACKBONES:
-        R = f"spatialmind/results/constraint_guided_v11_{bb}"
+        R = f"spatialmind/results/constraint_guided_{bb}"
         if not os.path.isdir(R):
             continue
         allres[bb] = run_backbone(bb)

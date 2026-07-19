@@ -5,7 +5,7 @@ delta-AUROC (SpatialMind - scores-only) with significance marker."""
 import json, sys
 
 BB = sys.argv[1] if len(sys.argv) > 1 else "mistral"
-d = json.load(open(f"spatialmind/results/constraint_guided_v11_{BB}/fusion/fair_ablation.json"))
+d = json.load(open(f"spatialmind/results/constraint_guided_{BB}/fusion/fair_ablation.json"))
 DS = ["StepGame", "SpaRTQA", "SpaRTUN", "SpaceNLI", "SpaRP"]
 ROWS = [("scores", "Stacking (scores only)"),
         ("symb", "\\quad + symbolizability gate"),

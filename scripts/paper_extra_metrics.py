@@ -21,8 +21,8 @@ from scripts.metrics import compute_all_metrics  # noqa: E402
 import scripts.fusion as F  # noqa: E402
 
 BACKBONE = os.environ.get("XM_BACKBONE", "mistral")
-SUB = f"constraint_guided_v11_{BACKBONE}"
-R = f"spatialmind/results/constraint_guided_v11_{BACKBONE}"
+SUB = f"constraint_guided_{BACKBONE}"
+R = f"spatialmind/results/constraint_guided_{BACKBONE}"
 DATASETS = [("id", "StepGame", "StepGame"), ("spartqa", "SpaRTQA", "spartqa"),
             ("SpaRTUN", "SpaRTUN", "SpaRTUN"), ("SpaceNLI", "SpaceNLI", "SpaceNLI"),
             ("SpaRP_PS3", "SpaRP", "SpaRP_PS3")]

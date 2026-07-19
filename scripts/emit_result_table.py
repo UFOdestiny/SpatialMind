@@ -10,7 +10,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import scripts.fusion as F
 
 BB = sys.argv[1] if len(sys.argv) > 1 else "mistral"
-R = f"spatialmind/results/constraint_guided_v11_{BB}"
+R = f"spatialmind/results/constraint_guided_{BB}"
 DS = [("id", "eval", "StepGame"), ("spartqa", "eval_ood/spartqa", "SpaRTQA"),
       ("SpaRTUN", "eval_ood/SpaRTUN", "SpaRTUN"), ("SpaceNLI", "eval_ood/SpaceNLI", "SpaceNLI"),
       ("SpaRP_PS3", "eval_ood/SpaRP_PS3", "SpaRP")]

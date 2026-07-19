@@ -8,8 +8,6 @@
 ###############################################################################
 
 #SBATCH --job-name=sm-train
-#SBATCH --account=fsu-compsci-dept
-#SBATCH --qos=fsu-compsci-dept
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
@@ -104,7 +102,7 @@ run_phase2() {
 
 if [[ ${_P2_SOURCED} -eq 0 ]]; then
     set -euo pipefail
-    SCRIPT_DIR="/home/dy23a.fsu/popllm/SpatialMind/jobs"
+    SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
     source "${SCRIPT_DIR}/common.sh"
     [[ -n "${HEAD_TYPES:-}" ]] && read -ra ALL_HEAD_TYPES <<< "${HEAD_TYPES}"
     RUN_LOG="${LOGS_ROOT}/phase_train.log"; mkdir -p "${LOGS_ROOT}"

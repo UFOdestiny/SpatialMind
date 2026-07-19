@@ -16,8 +16,19 @@
 ###############################################################################
 # Path Configuration
 ###############################################################################
-_SCRIPT_DIR="/home/dy23a.fsu/popllm/SpatialMind/jobs"
-_PROJECT_ROOT="$(dirname "${_SCRIPT_DIR}")"
+_SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+_PROJECT_ROOT="$(cd -- "${_SCRIPT_DIR}/.." && pwd)"
+
+# Optional, untracked machine/site configuration. This keeps local paths and
+# scheduler accounts out of the repository while making direct shell launches
+# behave the same as editor launches.
+_LOCAL_ENV="${_PROJECT_ROOT}/.env"
+if [[ -f "${_LOCAL_ENV}" ]]; then
+    set -a
+    # shellcheck disable=SC1090
+    source "${_LOCAL_ENV}"
+    set +a
+fi
 
 PROJECT_DIR="${PROJECT_DIR:-${_PROJECT_ROOT}}"
 # Runtime root: everything (logs/results/cache) is written here, as required.
