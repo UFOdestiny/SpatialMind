@@ -1,5 +1,13 @@
 # SpatialMind
 
+# Datasets
+
+- [StepGame](https://huggingface.co/datasets/ZhengyanShi/StepGame)
+- [SpaRTQA](https://huggingface.co/datasets/tasksource/spartqa-mchoice)
+- [SpaRTUN](https://huggingface.co/datasets/tasksource/SpaRTUN)
+- [SpaceNLI](https://huggingface.co/datasets/tasksource/SpaceNLI)
+- [SpaRP](https://huggingface.co/datasets/UKPLab/sparp)
+
 SpatialMind estimates whether an LLM's spatial-reasoning trace is correct.
 
 ## Idea
