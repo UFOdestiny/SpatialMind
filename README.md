@@ -1,4 +1,6 @@
-# SpatialMind
+# SymboUQ
+
+**SymboUQ: Symbolic Uncertainty Quantification for Spatial Reasoning in LLMs**
 
 # Datasets
 
@@ -8,7 +10,8 @@
 - [SpaceNLI](https://huggingface.co/datasets/tasksource/SpaceNLI)
 - [SpaRP](https://huggingface.co/datasets/UKPLab/sparp)
 
-SpatialMind estimates whether an LLM's spatial-reasoning trace is correct.
+SymboUQ estimates whether an LLM's spatial-reasoning trace is correct through
+symbolic uncertainty quantification.
 
 ## Idea
 
